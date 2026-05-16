@@ -1,5 +1,104 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 
+// ─── SUPABASE CONFIG ────────────────────────────────────────────────────────
+// Replace these with your actual Supabase project URL and anon key
+const SUPABASE_URL = "https://YOUR_PROJECT.supabase.co";
+const SUPABASE_ANON_KEY = "YOUR_ANON_KEY";
+
+async function sbFetch(path, opts = {}) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1${path}`, {
+    ...opts,
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      Prefer: opts.prefer || "",
+      ...(opts.headers || {}),
+    },
+  });
+  if (!res.ok) return null;
+  try { return await res.json(); } catch { return null; }
+}
+
+// Supabase leaderboard helpers
+async function fetchLeaderboard() {
+  const data = await sbFetch("/leaderboard?order=score.desc&limit=10&select=*");
+  return data || [];
+}
+async function submitScore(username, score, wave, skin) {
+  // Upsert: if same username exists with lower score, update it
+  const existing = await sbFetch(`/leaderboard?username=eq.${encodeURIComponent(username)}&select=id,score`);
+  if (existing && existing.length > 0) {
+    if (score > existing[0].score) {
+      await sbFetch(`/leaderboard?id=eq.${existing[0].id}`, {
+        method: "PATCH",
+        prefer: "return=minimal",
+        body: JSON.stringify({ score, wave, skin, date: new Date().toISOString().slice(0,10) }),
+      });
+    }
+  } else {
+    await sbFetch("/leaderboard", {
+      method: "POST",
+      prefer: "return=minimal",
+      body: JSON.stringify({ username, score, wave, skin, date: new Date().toISOString().slice(0,10) }),
+    });
+  }
+  return fetchLeaderboard();
+}
+
+// ─── SUPABASE REALTIME (for online PvP) ──────────────────────────────────────
+// Uses Supabase Realtime broadcast channel — no DB table needed
+function createRealtimeChannel(channelName, onMessage) {
+  const wsUrl = `${SUPABASE_URL.replace("https://", "wss://")}/realtime/v1/websocket?apikey=${SUPABASE_ANON_KEY}&vsn=1.0.0`;
+  let ws = null;
+  let heartbeat = null;
+  let closed = false;
+
+  function connect() {
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ topic: `realtime:${channelName}`, event: "phx_join", payload: {}, ref: "1" }));
+      heartbeat = setInterval(() => {
+        if (ws.readyState === 1) ws.send(JSON.stringify({ topic: "phoenix", event: "heartbeat", payload: {}, ref: "hb" }));
+      }, 25000);
+    };
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.event === "broadcast" && msg.payload?.event) {
+          onMessage(msg.payload.event, msg.payload.payload);
+        }
+      } catch {}
+    };
+    ws.onclose = () => {
+      clearInterval(heartbeat);
+      if (!closed) setTimeout(connect, 2000);
+    };
+  }
+
+  connect();
+
+  function send(event, payload) {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        topic: `realtime:${channelName}`,
+        event: "broadcast",
+        payload: { event, payload },
+        ref: String(Date.now()),
+      }));
+    }
+  }
+
+  function close() {
+    closed = true;
+    clearInterval(heartbeat);
+    ws && ws.close();
+  }
+
+  return { send, close };
+}
+
+// ─── GAME CONSTANTS ──────────────────────────────────────────────────────────
 const BORDER = 18, TW = 30, TH = 20;
 const BASE_SPEED = 2.8, FRICTION = 0.82, BSPEED = 6.2;
 const BASE_SHOOT_CD = 500, BASE_BULLET_LIFETIME = 180;
@@ -18,11 +117,14 @@ const SKINS = [
   { id: "obsidian", name: "Obsidian",      body: "#312e81", barrel: "#1e1b4b", tread: "#0a0928", price: 750 },
 ];
 
+// Single map used for all modes (Open Field)
+const OPEN_MAP = { id: "open", name: "Open Field", desc: "No cover. Pure aim wins.", bg: "#0d0d1a", grid: "#141428", border: "#1e1e3a", walls: [] };
+
 const MAPS = [
-  { id: "open",    name: "Open Field",  desc: "No cover. Pure aim wins.",                   price: 0,   bg: "#0d0d1a", grid: "#141428", border: "#1e1e3a", walls: [] },
+  { id: "open",    name: "Open Field",  desc: "No cover. Pure aim wins.",                   bg: "#0d0d1a", grid: "#141428", border: "#1e1e3a", walls: [] },
   {
-    id: "bunker", name: "Bunker", desc: "Central fortress. Player can enter; enemies patrol outside.",
-    price: 200, bg: "#0f0a05", grid: "#1a1208", border: "#3d2008",
+    id: "bunker", name: "Bunker", desc: "Central fortress.",
+    bg: "#0f0a05", grid: "#1a1208", border: "#3d2008",
     walls: [
       { x: 0.35, y: 0.33, w: 0.30, h: 0.07 },
       { x: 0.35, y: 0.60, w: 0.30, h: 0.07 },
@@ -32,8 +134,8 @@ const MAPS = [
     ]
   },
   {
-    id: "maze", name: "Labyrinth", desc: "Tight corridors. Bullets ricochet.",
-    price: 350, bg: "#00080a", grid: "#001214", border: "#004d5e",
+    id: "maze", name: "Labyrinth", desc: "Tight corridors.",
+    bg: "#00080a", grid: "#001214", border: "#004d5e",
     walls: [
       { x:0.20,y:0.20,w:0.04,h:0.30 },{ x:0.76,y:0.20,w:0.04,h:0.30 },
       { x:0.20,y:0.50,w:0.04,h:0.30 },{ x:0.76,y:0.50,w:0.04,h:0.30 },
@@ -42,8 +144,8 @@ const MAPS = [
     ]
   },
   {
-    id: "pillars", name: "Temple", desc: "Pillar maze. Cover everywhere.",
-    price: 250, bg: "#080510", grid: "#100a1a", border: "#2d1b4e",
+    id: "pillars", name: "Temple", desc: "Pillar maze.",
+    bg: "#080510", grid: "#100a1a", border: "#2d1b4e",
     walls: [
       { x:0.25, y:0.25, w:0.08, h:0.08 },
       { x:0.67, y:0.25, w:0.08, h:0.08 },
@@ -54,8 +156,8 @@ const MAPS = [
     ]
   },
   {
-    id: "canyon", name: "Canyon", desc: "Long corridors. Snipers' paradise.",
-    price: 300, bg: "#0a0502", grid: "#120a04", border: "#5c2d07",
+    id: "canyon", name: "Canyon", desc: "Long corridors.",
+    bg: "#0a0502", grid: "#120a04", border: "#5c2d07",
     walls: [
       { x:0.0,y:0.32,w:0.38,h:0.06 },{ x:0.62,y:0.32,w:0.38,h:0.06 },
       { x:0.0,y:0.62,w:0.38,h:0.06 },{ x:0.62,y:0.62,w:0.38,h:0.06 }
@@ -135,23 +237,13 @@ function roundRect(ctx,x,y,w,h,r) {
   ctx.closePath();
 }
 
-function loadLeaderboard() {
-  try { const d=localStorage.getItem("tw_lb"); return d?JSON.parse(d):[]; } catch { return []; }
-}
-function saveLeaderboard(entries) {
-  try { localStorage.setItem("tw_lb",JSON.stringify(entries)); } catch {}
-}
-function addLeaderboardEntry(score, wave, skin) {
-  const lb=loadLeaderboard();
-  lb.push({ score, wave, skin, date: new Date().toLocaleDateString() });
-  lb.sort((a,b)=>b.score-a.score);
-  const top=lb.slice(0,10);
-  saveLeaderboard(top);
-  return top;
-}
-
 // ── Detect touch device ──────────────────────────────────────────────────────
 const isTouchDevice = () => ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+
+// ── Generate a short random room code ───────────────────────────────────────
+function genRoomCode() {
+  return Math.random().toString(36).slice(2,7).toUpperCase();
+}
 
 export default function TankWars() {
   const canvasRef    = useRef(null);
@@ -168,41 +260,52 @@ export default function TankWars() {
   const mapRef       = useRef(MAPS[0]);
   const dimRef       = useRef({ W:800, H:560 });
 
+  // Online PvP refs
+  const onlinePvpRef    = useRef(null); // { channel, role: "host"|"guest", roomCode }
+  const onlineRoleRef   = useRef(null); // "host" or "guest"
+  const onlineReadyRef  = useRef({ host: false, guest: false });
+  const lastSentRef     = useRef(0);
+
   // Touch control refs
-  const moveJoystickRef  = useRef(null); // { startX, startY, currentX, currentY }
-  const aimJoystickRef   = useRef(null); // { startX, startY, currentX, currentY }
+  const moveJoystickRef  = useRef(null);
+  const aimJoystickRef   = useRef(null);
   const moveTouchIdRef   = useRef(null);
   const aimTouchIdRef    = useRef(null);
   const touchFireRef     = useRef(false);
   const isMobileRef      = useRef(false);
 
-  const [screen,           setScreen]           = useState("menu");
+  const [screen,           setScreen]           = useState("username");
+  const [username,         setUsername]         = useState("");
+  const [usernameInput,    setUsernameInput]     = useState("");
   const [coins,            setCoins]            = useState(0);
   const [ownedSkins,       setOwnedSkins]       = useState(["default"]);
-  const [ownedMaps,        setOwnedMaps]        = useState(["open"]);
   const [equippedSkin,     setEquippedSkin]     = useState("default");
-  const [equippedMap,      setEquippedMap]      = useState("open");
-  const [shopTab,          setShopTab]          = useState("skins");
   const [overData,         setOverData]         = useState({});
   const [hudData,          setHudData]          = useState({ hp1:100,hp2:100,maxHp1:100,maxHp2:100,score:0,wave:0,mode:"" });
   const [hoveredPu,        setHoveredPu]        = useState(null);
   const [hoveredMode,      setHoveredMode]      = useState(null);
   const [offeredPowerups,  setOfferedPowerups]  = useState([]);
   const [leaderboard,      setLeaderboard]      = useState([]);
-  const [pvpMapChoice,     setPvpMapChoice]     = useState("open");
+  const [lbLoading,        setLbLoading]        = useState(false);
   const [isMobile,         setIsMobile]         = useState(false);
   const [isLandscape,      setIsLandscape]      = useState(true);
   const [, rerender]      = useState(0);
 
+  // Online PvP UI state
+  const [onlineTab,        setOnlineTab]        = useState("create"); // "create" | "join"
+  const [roomCodeInput,    setRoomCodeInput]    = useState("");
+  const [currentRoomCode,  setCurrentRoomCode]  = useState("");
+  const [onlineStatus,     setOnlineStatus]     = useState(""); // status message
+  const [onlineWaiting,    setOnlineWaiting]    = useState(false);
+  const [pvpMapChoice,     setPvpMapChoice]     = useState("open");
+
   useEffect(() => {
-    setLeaderboard(loadLeaderboard());
     const mobile = isTouchDevice();
     setIsMobile(mobile);
     isMobileRef.current = mobile;
 
     function getOrientation() {
-      // Use screen.orientation API when available, fall back to window dimensions
-      if (screen.orientation) return screen.orientation.type.startsWith("landscape");
+      if (window.screen.orientation) return window.screen.orientation.type.startsWith("landscape");
       return window.innerWidth > window.innerHeight;
     }
 
@@ -211,20 +314,14 @@ export default function TankWars() {
       const ratio = 800 / 560;
       const landscape = getOrientation();
       setIsLandscape(landscape);
-
       let W, H;
       if (mobile) {
         if (landscape) {
-          // Landscape: maximize canvas height, keep ratio, leave ~40px for HUD strip
           const hudH = 36;
-          H = vh - hudH - 8;
-          W = H * ratio;
-          // If wider than screen, clamp to width
+          H = vh - hudH - 8; W = H * ratio;
           if (W > vw - 8) { W = vw - 8; H = W / ratio; }
         } else {
-          // Portrait: use full width, allow ~52% of height for canvas
-          W = vw - 8;
-          H = W / ratio;
+          W = vw - 8; H = W / ratio;
           const maxH = vh * 0.52;
           if (H > maxH) { H = maxH; W = H * ratio; }
         }
@@ -236,25 +333,16 @@ export default function TankWars() {
     }
 
     resize();
-
-    // Listen to both resize and orientationchange for instant response
     window.addEventListener("resize", resize);
-    window.addEventListener("orientationchange", () => {
-      // Small delay lets the browser finish rotating before we read dimensions
-      setTimeout(resize, 120);
-    });
-    if (screen.orientation) {
-      screen.orientation.addEventListener("change", resize);
-    }
-
+    window.addEventListener("orientationchange", () => setTimeout(resize, 120));
+    if (window.screen.orientation) window.screen.orientation.addEventListener("change", resize);
     return () => {
       window.removeEventListener("resize", resize);
-      window.removeEventListener("orientationchange", resize);
-      if (screen.orientation) screen.orientation.removeEventListener("change", resize);
+      if (window.screen.orientation) window.screen.orientation.removeEventListener("change", resize);
     };
   }, []);
 
-  // Keyboard controls (desktop)
+  // Keyboard controls
   useEffect(()=>{
     const down=e=>{
       keysRef.current[e.key.toLowerCase()]=true;
@@ -270,7 +358,7 @@ export default function TankWars() {
     return ()=>{window.removeEventListener("keydown",down);window.removeEventListener("keyup",up);};
   },[]);
 
-  // ── Touch controls setup ─────────────────────────────────────────────────
+  // Touch controls
   const handleCanvasTouch = useCallback((e) => {
     e.preventDefault();
     if (!isMobileRef.current) return;
@@ -278,49 +366,23 @@ export default function TankWars() {
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const midX = rect.left + rect.width / 2;
-
     for (const touch of e.changedTouches) {
-      const tx = touch.clientX;
-      const ty = touch.clientY;
-
+      const tx = touch.clientX, ty = touch.clientY;
       if (e.type === "touchstart") {
         if (tx < midX) {
-          // Left half = move joystick
-          if (moveTouchIdRef.current === null) {
-            moveTouchIdRef.current = touch.identifier;
-            moveJoystickRef.current = { startX: tx, startY: ty, currentX: tx, currentY: ty };
-          }
+          if (moveTouchIdRef.current === null) { moveTouchIdRef.current = touch.identifier; moveJoystickRef.current = { startX: tx, startY: ty, currentX: tx, currentY: ty }; }
         } else {
-          // Right half = aim joystick + fire
-          if (aimTouchIdRef.current === null) {
-            aimTouchIdRef.current = touch.identifier;
-            aimJoystickRef.current = { startX: tx, startY: ty, currentX: tx, currentY: ty };
-            touchFireRef.current = true;
-          }
+          if (aimTouchIdRef.current === null) { aimTouchIdRef.current = touch.identifier; aimJoystickRef.current = { startX: tx, startY: ty, currentX: tx, currentY: ty }; touchFireRef.current = true; }
         }
       } else if (e.type === "touchmove") {
-        if (touch.identifier === moveTouchIdRef.current && moveJoystickRef.current) {
-          moveJoystickRef.current.currentX = tx;
-          moveJoystickRef.current.currentY = ty;
-        }
+        if (touch.identifier === moveTouchIdRef.current && moveJoystickRef.current) { moveJoystickRef.current.currentX = tx; moveJoystickRef.current.currentY = ty; }
         if (touch.identifier === aimTouchIdRef.current && aimJoystickRef.current) {
-          aimJoystickRef.current.currentX = tx;
-          aimJoystickRef.current.currentY = ty;
-          const dx = tx - aimJoystickRef.current.startX;
-          const dy = ty - aimJoystickRef.current.startY;
-          // Fire continuously when aim joystick is moved significantly
-          touchFireRef.current = Math.hypot(dx, dy) > 5;
+          aimJoystickRef.current.currentX = tx; aimJoystickRef.current.currentY = ty;
+          touchFireRef.current = Math.hypot(tx - aimJoystickRef.current.startX, ty - aimJoystickRef.current.startY) > 5;
         }
       } else if (e.type === "touchend" || e.type === "touchcancel") {
-        if (touch.identifier === moveTouchIdRef.current) {
-          moveTouchIdRef.current = null;
-          moveJoystickRef.current = null;
-        }
-        if (touch.identifier === aimTouchIdRef.current) {
-          aimTouchIdRef.current = null;
-          aimJoystickRef.current = null;
-          touchFireRef.current = false;
-        }
+        if (touch.identifier === moveTouchIdRef.current) { moveTouchIdRef.current = null; moveJoystickRef.current = null; }
+        if (touch.identifier === aimTouchIdRef.current) { aimTouchIdRef.current = null; aimJoystickRef.current = null; touchFireRef.current = false; }
       }
     }
   }, []);
@@ -414,6 +476,115 @@ export default function TankWars() {
     setScreen("game");
   }
 
+  // ── Online PvP: Create Room ──────────────────────────────────────────────
+  function createOnlineRoom() {
+    const code = genRoomCode();
+    setCurrentRoomCode(code);
+    setOnlineStatus("Waiting for opponent to join...");
+    setOnlineWaiting(true);
+    onlineRoleRef.current = "host";
+    onlineReadyRef.current = { host: false, guest: false };
+
+    const channel = createRealtimeChannel(`tankwars-${code}`, (event, payload) => {
+      if (event === "join") {
+        // Guest joined — send ack + map choice
+        setOnlineStatus("Opponent found! Starting...");
+        channel.send("ack", { map: pvpMapChoice, hostSkin: equippedSkin });
+        onlineReadyRef.current.host = true;
+        onlineReadyRef.current.guest = true;
+        setTimeout(() => startOnlineGame("host", code, pvpMapChoice, channel), 500);
+      }
+      if (event === "state") {
+        // Incoming opponent state update (guest → host mirror)
+        applyRemoteState(payload);
+      }
+    });
+
+    onlinePvpRef.current = { channel, role: "host", roomCode: code };
+  }
+
+  function joinOnlineRoom(code) {
+    if (!code.trim()) return;
+    const upper = code.trim().toUpperCase();
+    setOnlineStatus("Connecting...");
+    setOnlineWaiting(true);
+    onlineRoleRef.current = "guest";
+    onlineReadyRef.current = { host: false, guest: false };
+
+    const channel = createRealtimeChannel(`tankwars-${upper}`, (event, payload) => {
+      if (event === "ack") {
+        // Host acknowledged, start game
+        setOnlineStatus("Connected! Starting...");
+        setTimeout(() => startOnlineGame("guest", upper, payload.map || "open", channel), 500);
+      }
+      if (event === "state") {
+        applyRemoteState(payload);
+      }
+    });
+
+    onlinePvpRef.current = { channel, role: "guest", roomCode: upper };
+    // Signal host that guest has joined
+    setTimeout(() => channel.send("join", { guestSkin: equippedSkin }), 800);
+  }
+
+  function applyRemoteState(payload) {
+    if (!stateRef.current) return;
+    const s = stateRef.current;
+    const role = onlineRoleRef.current;
+    // Host controls p1, guest controls p2. Each side receives the other's data.
+    if (role === "host" && payload.p2) {
+      Object.assign(s.p2, payload.p2);
+      if (payload.bullets) {
+        // Merge remote bullets (tagged remote=true)
+        s.bullets = s.bullets.filter(b => !b.remote);
+        payload.bullets.forEach(b => s.bullets.push({ ...b, remote: true }));
+      }
+    } else if (role === "guest" && payload.p1) {
+      Object.assign(s.p1, payload.p1);
+      if (payload.bullets) {
+        s.bullets = s.bullets.filter(b => !b.remote);
+        payload.bullets.forEach(b => s.bullets.push({ ...b, remote: true }));
+      }
+    }
+  }
+
+  function startOnlineGame(role, roomCode, mapId, channel) {
+    const {W,H} = dimRef.current;
+    keysRef.current = {};
+    scoreRef.current = 0;
+    p1WinsRef.current = 0; p2WinsRef.current = 0;
+    pendingPuRef.current = false;
+    mapRef.current = getMap(mapId);
+
+    const hostSkin = getSkin(equippedSkin);
+    const guestSkin = getSkin("crimson");
+
+    stateRef.current = {
+      p1: makeTank(120, H/2, 100, hostSkin),
+      p2: makeTank(W-120, H/2, 100, guestSkin),
+      enemies: [], bullets: [], particles: [], explosions: [],
+      roundOver: false, roundOverTimer: 0, roundWinner: "",
+    };
+
+    onlinePvpRef.current = { channel, role, roomCode };
+    modeRef.current = "online";
+    setOnlineWaiting(false);
+    setOnlineStatus("");
+    setScreen("game");
+  }
+
+  function cleanupOnlineRoom() {
+    if (onlinePvpRef.current?.channel) {
+      onlinePvpRef.current.channel.close();
+      onlinePvpRef.current = null;
+    }
+    onlineRoleRef.current = null;
+    setOnlineWaiting(false);
+    setOnlineStatus("");
+    setCurrentRoomCode("");
+    setRoomCodeInput("");
+  }
+
   function resetPvPRound() {
     const {W,H}=dimRef.current;
     const s=stateRef.current;
@@ -439,10 +610,16 @@ export default function TankWars() {
     if(coins<price) return;
     setCoins(c=>c-price);
     if(type==="skin") setOwnedSkins(s=>[...s,id]);
-    if(type==="map")  setOwnedMaps(m=>[...m,id]);
   }
 
-  // ─── GAME LOOP ────────────────────────────────────────────────────────────
+  async function loadLeaderboard() {
+    setLbLoading(true);
+    const data = await fetchLeaderboard();
+    setLeaderboard(data);
+    setLbLoading(false);
+  }
+
+  // ─── GAME LOOP ─────────────────────────────────────────────────────────────
   useEffect(()=>{
     if(screen!=="game") return;
     const canvas=canvasRef.current;
@@ -471,6 +648,7 @@ export default function TankWars() {
         pierced:[],
         isCrit:critMult>1,
         shooterRef:shooter,
+        remote:false,
       });
     }
 
@@ -486,38 +664,23 @@ export default function TankWars() {
       spawnParticles(x,y,"#f97316",16);
     }
 
-    // ── Mobile input helper ──────────────────────────────────────────────────
     function getMobileInput(p, ts) {
-      const DEAD = 12; // deadzone px
+      const DEAD = 12;
       let ax = 0, ay = 0, fire = false, dash = false;
-
       const mj = moveJoystickRef.current;
       if (mj) {
-        const dx = mj.currentX - mj.startX;
-        const dy = mj.currentY - mj.startY;
+        const dx = mj.currentX - mj.startX, dy = mj.currentY - mj.startY;
         const dist = Math.hypot(dx, dy);
-        if (dist > DEAD) {
-          ax = dx / Math.max(dist, 1);
-          ay = dy / Math.max(dist, 1);
-        }
+        if (dist > DEAD) { ax = dx / Math.max(dist, 1); ay = dy / Math.max(dist, 1); }
       }
-
       const aj = aimJoystickRef.current;
       if (aj) {
-        const dx = aj.currentX - aj.startX;
-        const dy = aj.currentY - aj.startY;
+        const dx = aj.currentX - aj.startX, dy = aj.currentY - aj.startY;
         const dist = Math.hypot(dx, dy);
-        if (dist > DEAD) {
-          // Rotate tank toward aim direction
-          const targetAngle = Math.atan2(dy, dx);
-          p.angle = targetAngle;
-        }
+        if (dist > DEAD) { const targetAngle = Math.atan2(dy, dx); p.angle = targetAngle; }
         fire = touchFireRef.current;
       }
-
-      // Auto-dash: double-tap move joystick (simplified: dash button not needed)
       dash = keysRef.current["shift"] || false;
-
       return { ax, ay, fire, dash };
     }
 
@@ -534,13 +697,9 @@ export default function TankWars() {
       }
 
       let ax=0,ay=0;
-
-      // Mobile override for p1
       if(isMobileRef.current && shooterId==="p1") {
         const mi = getMobileInput(p, ts);
-        ax = mi.ax; ay = mi.ay;
-        fire = mi.fire || fire;
-        dash = mi.dash || dash;
+        ax = mi.ax; ay = mi.ay; fire = mi.fire || fire; dash = mi.dash || dash;
       } else {
         if(fwd) ay-=1; if(back) ay+=1; if(left) ax-=1; if(right) ax+=1;
         if(ax&&ay){ax*=0.707;ay*=0.707;}
@@ -557,18 +716,12 @@ export default function TankWars() {
 
       const hw=TW/2,hh=TH/2;
       const BL=BORDER+hw,BR=W-BORDER-hw,BT=BORDER+hh,BB=H-BORDER-hh;
-
       let newX=Math.max(BL,Math.min(BR,p.x+p.vx));
-      for(const w of walls){
-        if(rectsOverlap(newX-hw,p.y-hh,TW,TH,w.x,w.y,w.w,w.h)){newX=p.x;p.vx=0;break;}
-      }
+      for(const w of walls){if(rectsOverlap(newX-hw,p.y-hh,TW,TH,w.x,w.y,w.w,w.h)){newX=p.x;p.vx=0;break;}}
       let newY=Math.max(BT,Math.min(BB,p.y+p.vy));
-      for(const w of walls){
-        if(rectsOverlap(newX-hw,newY-hh,TW,TH,w.x,w.y,w.w,w.h)){newY=p.y;p.vy=0;break;}
-      }
+      for(const w of walls){if(rectsOverlap(newX-hw,newY-hh,TW,TH,w.x,w.y,w.w,w.h)){newY=p.y;p.vy=0;break;}}
       p.x=newX;p.y=newY;
 
-      // On mobile p1, angle is set by aim joystick directly; only update from movement if no aim joystick
       if(!(isMobileRef.current && shooterId==="p1" && aimJoystickRef.current)) {
         if(ax||ay){
           const ta=Math.atan2(ay,ax);
@@ -582,11 +735,8 @@ export default function TankWars() {
       if(fire&&ts-p.lastShot>(p.shootCd||BASE_SHOOT_CD)){
         const critMult=(p.hasOvercharge&&p.overchargeCd<=0)?3:1;
         if(p.hasOvercharge&&p.overchargeCd<=0) p.overchargeCd=300;
-
-        const bx=p.x+Math.cos(p.angle)*17;
-        const by=p.y+Math.sin(p.angle)*17;
+        const bx=p.x+Math.cos(p.angle)*17, by=p.y+Math.sin(p.angle)*17;
         shootBullet(bx,by,p.angle,shooterId,p.color,p,critMult);
-
         if(p.doubleShot){
           const perp=p.angle+Math.PI/2;
           shootBullet(p.x+Math.cos(perp)*6+Math.cos(p.angle)*15,p.y+Math.sin(perp)*6+Math.sin(p.angle)*15,p.angle,shooterId,p.color,p,critMult);
@@ -608,9 +758,7 @@ export default function TankWars() {
 
     function updateEnemyAI(e, target, ts, walls, W, H) {
       if (!target || target.hp <= 0) return;
-
-      const dx = target.x - e.x;
-      const dy = target.y - e.y;
+      const dx = target.x - e.x, dy = target.y - e.y;
       const dist = Math.hypot(dx, dy);
       const canSee = hasLineOfSight(e.x, e.y, target.x, target.y, walls);
       const hpRatio = e.hp / e.maxHp;
@@ -623,52 +771,31 @@ export default function TankWars() {
         if (moved < 8) {
           let wx, wy, valid = false;
           for (let attempt = 0; attempt < 12; attempt++) {
-            wx = BL + Math.random() * (BR - BL);
-            wy = BT + Math.random() * (BB - BT);
-            valid = true;
-            for (const w of walls) {
-              if (rectsOverlap(wx - hw - 10, wy - hh - 10, TW + 20, TH + 20, w.x, w.y, w.w, w.h)) {
-                valid = false; break;
-              }
-            }
+            wx = BL + Math.random() * (BR - BL); wy = BT + Math.random() * (BB - BT); valid = true;
+            for (const w of walls) { if (rectsOverlap(wx - hw - 10, wy - hh - 10, TW + 20, TH + 20, w.x, w.y, w.w, w.h)) { valid = false; break; } }
             if (valid) break;
           }
           if (valid) { e.waypointX = wx; e.waypointY = wy; }
         }
-        e.lastX = e.x; e.lastY = e.y;
-        e.stuckTimer = 0;
+        e.lastX = e.x; e.lastY = e.y; e.stuckTimer = 0;
       }
 
-      if (hpRatio < 0.3) {
-        e.aiState = "retreat";
-      } else if (!canSee) {
-        e.aiState = "flank";
-      } else if (dist < 140) {
-        e.aiState = "strafe";
-      } else {
-        e.aiState = "approach";
-      }
+      if (hpRatio < 0.3) e.aiState = "retreat";
+      else if (!canSee) e.aiState = "flank";
+      else if (dist < 140) e.aiState = "strafe";
+      else e.aiState = "approach";
 
       let moveAngle = Math.atan2(dy, dx);
       let moveSpeed = e.spd * (e.slowTimer > 0 ? 0.3 : 1);
 
       if (e.waypointX !== null) {
-        const wdx = e.waypointX - e.x;
-        const wdy = e.waypointY - e.y;
-        const wdist = Math.hypot(wdx, wdy);
-        if (wdist < 20) {
-          e.waypointX = null; e.waypointY = null;
-        } else {
-          moveAngle = Math.atan2(wdy, wdx);
-        }
+        const wdx = e.waypointX - e.x, wdy = e.waypointY - e.y, wdist = Math.hypot(wdx, wdy);
+        if (wdist < 20) { e.waypointX = null; e.waypointY = null; } else moveAngle = Math.atan2(wdy, wdx);
       } else if (e.aiState === "retreat") {
         moveAngle = Math.atan2(-dy, -dx) + (e.strafeDir * 0.6);
       } else if (e.aiState === "strafe") {
         e.strafeTimer = (e.strafeTimer || 0) + 1;
-        if (e.strafeTimer > 90 + Math.random() * 60) {
-          e.strafeDir *= -1;
-          e.strafeTimer = 0;
-        }
+        if (e.strafeTimer > 90 + Math.random() * 60) { e.strafeDir *= -1; e.strafeTimer = 0; }
         const perpAngle = Math.atan2(dy, dx) + Math.PI / 2 * e.strafeDir;
         const distError = dist - 120;
         const approachBlend = Math.max(-0.4, Math.min(0.4, distError / 200));
@@ -680,196 +807,98 @@ export default function TankWars() {
         moveAngle = Math.atan2(dy, dx) + (Math.sin(ts * 0.003 + e.flankAngle) * 0.25);
       }
 
-      const vx = Math.cos(moveAngle) * moveSpeed;
-      const vy = Math.sin(moveAngle) * moveSpeed;
-
-      let newX = Math.max(BL, Math.min(BR, e.x + vx));
-      let blockedX = false;
-      for (const w of walls) {
-        if (rectsOverlap(newX - hw, e.y - hh, TW, TH, w.x, w.y, w.w, w.h)) {
-          newX = e.x; blockedX = true; break;
-        }
-      }
-
-      let newY = Math.max(BT, Math.min(BB, e.y + vy));
-      let blockedY = false;
-      for (const w of walls) {
-        if (rectsOverlap(newX - hw, newY - hh, TW, TH, w.x, w.y, w.w, w.h)) {
-          newY = e.y; blockedY = true; break;
-        }
-      }
-
+      const vx = Math.cos(moveAngle) * moveSpeed, vy = Math.sin(moveAngle) * moveSpeed;
+      let newX = Math.max(BL, Math.min(BR, e.x + vx)), blockedX = false;
+      for (const w of walls) { if (rectsOverlap(newX - hw, e.y - hh, TW, TH, w.x, w.y, w.w, w.h)) { newX = e.x; blockedX = true; break; } }
+      let newY = Math.max(BT, Math.min(BB, e.y + vy)), blockedY = false;
+      for (const w of walls) { if (rectsOverlap(newX - hw, newY - hh, TW, TH, w.x, w.y, w.w, w.h)) { newY = e.y; blockedY = true; break; } }
       if (blockedX && blockedY) e.stuckTimer += 20;
       e.x = newX; e.y = newY;
 
       const travelTime = dist / BSPEED;
-      const predX = target.x + (target.vx || 0) * travelTime;
-      const predY = target.y + (target.vy || 0) * travelTime;
+      const predX = target.x + (target.vx || 0) * travelTime, predY = target.y + (target.vy || 0) * travelTime;
       const aimAngle = Math.atan2(predY - e.y, predX - e.x);
-
       let angleDiff = aimAngle - e.angle;
       while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
       while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
       e.angle += angleDiff * 0.1;
 
-      const aimError = Math.abs(angleDiff);
-      if (canSee && aimError < 0.25 && ts - e.lastShot > e.shootDelay) {
-        const bx = e.x + Math.cos(e.angle) * 16;
-        const by = e.y + Math.sin(e.angle) * 16;
-        shootBullet(bx, by, e.angle, "enemy", "#f97316",
-          { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE + (e.isElite ? 2 : 0) + (e.isBoss ? 3 : 0), bulletDamage: e.isBoss ? 14 : e.isElite ? 9 : 5 });
-        if (e.isElite || e.isBoss) {
-          shootBullet(e.x + Math.cos(e.angle + 0.3) * 16, e.y + Math.sin(e.angle + 0.3) * 16, e.angle + 0.3, "enemy",
-            e.isBoss ? "#fbbf24" : "#ff6b00",
-            { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE, bulletDamage: e.isBoss ? 10 : 7 });
-        }
-        if (e.isBoss) {
-          shootBullet(e.x + Math.cos(e.angle - 0.3) * 16, e.y + Math.sin(e.angle - 0.3) * 16, e.angle - 0.3, "enemy", "#fbbf24",
-            { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE, bulletDamage: 10 });
-        }
+      if (canSee && Math.abs(angleDiff) < 0.25 && ts - e.lastShot > e.shootDelay) {
+        const bx = e.x + Math.cos(e.angle) * 16, by = e.y + Math.sin(e.angle) * 16;
+        shootBullet(bx, by, e.angle, "enemy", "#f97316", { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE + (e.isElite ? 2 : 0) + (e.isBoss ? 3 : 0), bulletDamage: e.isBoss ? 14 : e.isElite ? 9 : 5 });
+        if (e.isElite || e.isBoss) shootBullet(e.x + Math.cos(e.angle + 0.3) * 16, e.y + Math.sin(e.angle + 0.3) * 16, e.angle + 0.3, "enemy", e.isBoss ? "#fbbf24" : "#ff6b00", { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE, bulletDamage: e.isBoss ? 10 : 7 });
+        if (e.isBoss) shootBullet(e.x + Math.cos(e.angle - 0.3) * 16, e.y + Math.sin(e.angle - 0.3) * 16, e.angle - 0.3, "enemy", "#fbbf24", { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE, bulletDamage: 10 });
         e.lastShot = ts;
-      } else if (!canSee && ts - e.lastShot > e.shootDelay * 2) {
-        if (dist < 200) {
-          const bx = e.x + Math.cos(e.angle) * 16;
-          const by = e.y + Math.sin(e.angle) * 16;
-          shootBullet(bx, by, e.angle, "enemy", "#f97316",
-            { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE, bulletDamage: e.isBoss ? 14 : e.isElite ? 9 : 5 });
-          e.lastShot = ts;
-        }
+      } else if (!canSee && ts - e.lastShot > e.shootDelay * 2 && dist < 200) {
+        shootBullet(e.x + Math.cos(e.angle) * 16, e.y + Math.sin(e.angle) * 16, e.angle, "enemy", "#f97316", { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE, bulletDamage: e.isBoss ? 14 : e.isElite ? 9 : 5 });
+        e.lastShot = ts;
       }
-
       if (e.slowTimer > 0) e.slowTimer--;
     }
 
     function drawTank(t, label) {
-      ctx.save();
-      ctx.translate(t.x, t.y);
-      ctx.rotate(t.angle);
-
-      const bodyColor = t.color;
-      const barrelColor = t.barrel;
-      const treadColor = t.tread;
-
+      ctx.save(); ctx.translate(t.x, t.y); ctx.rotate(t.angle);
       const treadH = 6, treadW = TW + 10, treadY = TH / 2 + 1;
-
-      ctx.fillStyle = treadColor;
+      ctx.fillStyle = t.tread;
       ctx.beginPath(); roundRect(ctx, -treadW/2, -treadY - treadH, treadW, treadH, 3); ctx.fill();
       ctx.beginPath(); roundRect(ctx, -treadW/2, treadY, treadW, treadH, 3); ctx.fill();
-
-      ctx.strokeStyle = "rgba(255,255,255,0.15)";
-      ctx.lineWidth = 0.8;
+      ctx.strokeStyle = "rgba(255,255,255,0.15)"; ctx.lineWidth = 0.8;
       const segCount = 8;
       for (let i = 0; i <= segCount; i++) {
         const segX = -treadW/2 + (i * treadW / segCount);
-        ctx.beginPath();
-        ctx.moveTo(segX, -treadY - treadH);
-        ctx.lineTo(segX, -treadY);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(segX, treadY);
-        ctx.lineTo(segX, treadY + treadH);
-        ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(segX, -treadY - treadH); ctx.lineTo(segX, -treadY); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(segX, treadY); ctx.lineTo(segX, treadY + treadH); ctx.stroke();
       }
-
       ctx.fillStyle = "rgba(0,0,0,0.45)";
-      const wheelXPositions = [-TW/2+2, -TW/6, TW/6, TW/2-2];
-      const wheelR = 3.2;
+      const wheelXPositions = [-TW/2+2, -TW/6, TW/6, TW/2-2], wheelR = 3.2;
       for (const wx of wheelXPositions) {
         ctx.beginPath(); ctx.arc(wx, -treadY - treadH/2, wheelR, 0, Math.PI*2); ctx.fill();
         ctx.beginPath(); ctx.arc(wx, treadY + treadH/2, wheelR, 0, Math.PI*2); ctx.fill();
       }
-      ctx.strokeStyle = "rgba(255,255,255,0.18)";
-      ctx.lineWidth = 0.8;
+      ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 0.8;
       for (const wx of wheelXPositions) {
         ctx.beginPath(); ctx.arc(wx, -treadY - treadH/2, wheelR - 1, 0, Math.PI*2); ctx.stroke();
         ctx.beginPath(); ctx.arc(wx, treadY + treadH/2, wheelR - 1, 0, Math.PI*2); ctx.stroke();
       }
-
-      ctx.fillStyle = bodyColor;
+      ctx.fillStyle = t.color;
       ctx.beginPath(); roundRect(ctx, -TW/2, -TH/2, TW, TH, 4); ctx.fill();
-
-      ctx.strokeStyle = "rgba(0,0,0,0.35)";
-      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(-TW/2+4, 0); ctx.lineTo(TW/2-4, 0); ctx.stroke();
-
       ctx.fillStyle = "rgba(0,0,0,0.3)";
-      const boltPositions = [[-TW/2+4,-TH/2+4],[TW/2-4,-TH/2+4],[-TW/2+4,TH/2-4],[TW/2-4,TH/2-4]];
-      for (const [bx,by] of boltPositions) {
+      for (const [bx,by] of [[-TW/2+4,-TH/2+4],[TW/2-4,-TH/2+4],[-TW/2+4,TH/2-4],[TW/2-4,TH/2-4]]) {
         ctx.beginPath(); ctx.arc(bx, by, 1.5, 0, Math.PI*2); ctx.fill();
       }
-
       const grad = ctx.createLinearGradient(0, -TH/2, 0, 0);
-      grad.addColorStop(0, "rgba(255,255,255,0.22)");
-      grad.addColorStop(1, "rgba(255,255,255,0)");
+      grad.addColorStop(0, "rgba(255,255,255,0.22)"); grad.addColorStop(1, "rgba(255,255,255,0)");
       ctx.fillStyle = grad;
       ctx.beginPath(); roundRect(ctx, -TW/2, -TH/2, TW, TH/2, 4); ctx.fill();
-
-      ctx.fillStyle = "rgba(0,0,0,0.4)";
-      ctx.beginPath(); ctx.arc(0, 0, 9.5, 0, Math.PI*2); ctx.fill();
-
-      ctx.fillStyle = barrelColor;
-      ctx.beginPath(); ctx.arc(0, 0, 8.5, 0, Math.PI*2); ctx.fill();
-
-      ctx.fillStyle = "rgba(255,255,255,0.18)";
-      ctx.beginPath(); ctx.arc(-1.5, -2, 4.5, 0, Math.PI*2); ctx.fill();
-
-      ctx.fillStyle = "rgba(0,0,0,0.4)";
-      ctx.beginPath(); roundRect(ctx, 5, -3.5, 20, 7, 2); ctx.fill();
-      ctx.fillStyle = barrelColor;
-      ctx.beginPath(); roundRect(ctx, 6, -2.5, 18, 5, 2); ctx.fill();
-      ctx.fillStyle = "rgba(255,255,255,0.15)";
-      ctx.fillRect(7, -2.5, 16, 1.5);
-      ctx.fillStyle = "rgba(0,0,0,0.6)";
-      ctx.beginPath(); roundRect(ctx, 22, -3, 4, 6, 1.5); ctx.fill();
-      ctx.fillStyle = barrelColor;
-      ctx.beginPath(); roundRect(ctx, 22.5, -2.5, 3, 5, 1); ctx.fill();
-
-      ctx.fillStyle = "rgba(0,0,0,0.5)";
-      ctx.beginPath(); ctx.arc(-2, 1, 4, 0, Math.PI*2); ctx.fill();
-      ctx.fillStyle = bodyColor;
-      ctx.beginPath(); ctx.arc(-2, 1, 2.8, 0, Math.PI*2); ctx.fill();
-
-      if (t.damageReduction > 0) {
-        ctx.beginPath(); ctx.arc(0, 0, 25, 0, Math.PI*2);
-        ctx.strokeStyle = `rgba(110,231,183,${t.damageReduction*0.6})`;
-        ctx.lineWidth = 2.5; ctx.stroke();
-      }
-      if (t.hasBarrier && t.barrierCd <= 0) {
-        ctx.beginPath(); ctx.arc(0, 0, 27, 0, Math.PI*2);
-        ctx.strokeStyle = "rgba(96,165,250,0.7)"; ctx.lineWidth = 2; ctx.stroke();
-      }
-      if (t.hasDash) {
-        ctx.beginPath(); ctx.arc(0, 0, 28, 0, Math.PI*2);
-        ctx.strokeStyle = "rgba(163,230,53,0.15)"; ctx.lineWidth = 1; ctx.stroke();
-      }
-
+      ctx.fillStyle = "rgba(0,0,0,0.4)"; ctx.beginPath(); ctx.arc(0, 0, 9.5, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = t.barrel; ctx.beginPath(); ctx.arc(0, 0, 8.5, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = "rgba(255,255,255,0.18)"; ctx.beginPath(); ctx.arc(-1.5, -2, 4.5, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = "rgba(0,0,0,0.4)"; ctx.beginPath(); roundRect(ctx, 5, -3.5, 20, 7, 2); ctx.fill();
+      ctx.fillStyle = t.barrel; ctx.beginPath(); roundRect(ctx, 6, -2.5, 18, 5, 2); ctx.fill();
+      ctx.fillStyle = "rgba(255,255,255,0.15)"; ctx.fillRect(7, -2.5, 16, 1.5);
+      ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.beginPath(); roundRect(ctx, 22, -3, 4, 6, 1.5); ctx.fill();
+      ctx.fillStyle = t.barrel; ctx.beginPath(); roundRect(ctx, 22.5, -2.5, 3, 5, 1); ctx.fill();
+      ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.beginPath(); ctx.arc(-2, 1, 4, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = t.color; ctx.beginPath(); ctx.arc(-2, 1, 2.8, 0, Math.PI*2); ctx.fill();
+      if (t.damageReduction > 0) { ctx.beginPath(); ctx.arc(0, 0, 25, 0, Math.PI*2); ctx.strokeStyle = `rgba(110,231,183,${t.damageReduction*0.6})`; ctx.lineWidth = 2.5; ctx.stroke(); }
+      if (t.hasBarrier && t.barrierCd <= 0) { ctx.beginPath(); ctx.arc(0, 0, 27, 0, Math.PI*2); ctx.strokeStyle = "rgba(96,165,250,0.7)"; ctx.lineWidth = 2; ctx.stroke(); }
+      if (t.hasDash) { ctx.beginPath(); ctx.arc(0, 0, 28, 0, Math.PI*2); ctx.strokeStyle = "rgba(163,230,53,0.15)"; ctx.lineWidth = 1; ctx.stroke(); }
       ctx.restore();
-
       const bw = 42, ratio = Math.max(0, t.hp / t.maxHp);
-      ctx.fillStyle = "#080808";
-      ctx.fillRect(t.x-bw/2, t.y-TH/2-13, bw, 6);
+      ctx.fillStyle = "#080808"; ctx.fillRect(t.x-bw/2, t.y-TH/2-13, bw, 6);
       ctx.fillStyle = ratio>0.5?"#4ade80":ratio>0.25?"#facc15":"#f87171";
       ctx.fillRect(t.x-bw/2, t.y-TH/2-13, bw*ratio, 6);
       ctx.strokeStyle = "rgba(255,255,255,0.08)"; ctx.lineWidth=0.5;
       ctx.strokeRect(t.x-bw/2, t.y-TH/2-13, bw, 6);
-
-      if (label) {
-        ctx.fillStyle = t.color; ctx.font = "bold 10px 'Courier New'"; ctx.textAlign = "center";
-        ctx.fillText(label, t.x, t.y-TH/2-18); ctx.textAlign = "left";
-      }
-
-      if (t.slowTimer > 0) {
-        ctx.globalAlpha = 0.4;
-        ctx.fillStyle = "#7dd3fc";
-        ctx.beginPath(); ctx.arc(t.x, t.y, 16, 0, Math.PI*2); ctx.fill();
-        ctx.globalAlpha = 1;
-      }
+      if (label) { ctx.fillStyle = t.color; ctx.font = "bold 10px 'Courier New'"; ctx.textAlign = "center"; ctx.fillText(label, t.x, t.y-TH/2-18); ctx.textAlign = "left"; }
+      if (t.slowTimer > 0) { ctx.globalAlpha = 0.4; ctx.fillStyle = "#7dd3fc"; ctx.beginPath(); ctx.arc(t.x, t.y, 16, 0, Math.PI*2); ctx.fill(); ctx.globalAlpha = 1; }
     }
 
     function updateBullet(b) {
       const {W,H}=dimRef.current;
       const walls=getWalls();
-
       if(b.homing&&stateRef.current.enemies.length>0&&b.shooterId==="p1"){
         let nearest=null,nearDist=Infinity;
         stateRef.current.enemies.forEach(e=>{const d=Math.hypot(e.x-b.x,e.y-b.y);if(d<nearDist){nearDist=d;nearest=e;}});
@@ -881,30 +910,22 @@ export default function TankWars() {
           b.angle+=diff*0.05;
         }
       }
-
-      b.x+=Math.cos(b.angle)*BSPEED;
-      b.y+=Math.sin(b.angle)*BSPEED;
-      b.life--;
-
+      b.x+=Math.cos(b.angle)*BSPEED; b.y+=Math.sin(b.angle)*BSPEED; b.life--;
       if(!b.ghost){
         const WL=BORDER+2,WR=W-BORDER-2,WT=BORDER+2,WB=H-BORDER-2;
         let bounced=false;
-
         if(b.x<=WL){b.x=WL+1;b.angle=Math.PI-b.angle;bounced=true;}
         else if(b.x>=WR){b.x=WR-1;b.angle=Math.PI-b.angle;bounced=true;}
         if(b.y<=WT){b.y=WT+1;b.angle=-b.angle;bounced=true;}
         else if(b.y>=WB){b.y=WB-1;b.angle=-b.angle;bounced=true;}
-
         for(const w of walls){
           if(circleRect(b.x,b.y,b.size,w.x,w.y,w.w,w.h)){
             if(b.warp){
               const {W:WW,H:HH}=dimRef.current;
-              b.x=BORDER+20+Math.random()*(WW-BORDER*2-40);
-              b.y=BORDER+20+Math.random()*(HH-BORDER*2-40);
+              b.x=BORDER+20+Math.random()*(WW-BORDER*2-40); b.y=BORDER+20+Math.random()*(HH-BORDER*2-40);
               spawnParticles(b.x,b.y,"#d946ef",6);
             } else {
-              const cx=w.x+w.w/2,cy=w.y+w.h/2;
-              const dx=b.x-cx,dy=b.y-cy;
+              const cx=w.x+w.w/2,cy=w.y+w.h/2,dx=b.x-cx,dy=b.y-cy;
               if(Math.abs(dx/w.w)>Math.abs(dy/w.h)) b.angle=Math.PI-b.angle;
               else b.angle=-b.angle;
               bounced=true;
@@ -912,63 +933,33 @@ export default function TankWars() {
             break;
           }
         }
-
         if(bounced){b.bounces++;spawnParticles(b.x,b.y,"#fff",3);}
       }
     }
 
-    // ── Draw mobile joysticks overlay ────────────────────────────────────────
     function drawMobileControls() {
       const {W,H}=dimRef.current;
-      const jRadius = Math.min(W, H) * 0.1;
-      const knobR = jRadius * 0.45;
-
-      // Left joystick (move)
+      const jRadius = Math.min(W, H) * 0.1, knobR = jRadius * 0.45;
       const lx = W * 0.2, ly = H * 0.75;
       const mj = moveJoystickRef.current;
-
       ctx.globalAlpha = 0.25;
       ctx.beginPath(); ctx.arc(lx, ly, jRadius, 0, Math.PI*2);
       ctx.strokeStyle = "#22c55e"; ctx.lineWidth = 2; ctx.stroke();
-      ctx.fillStyle = "#22c55e";
-      ctx.beginPath();
-      if (mj) {
-        const dx = mj.currentX - mj.startX;
-        const dy = mj.currentY - mj.startY;
-        const dist = Math.min(Math.hypot(dx, dy), jRadius * 0.6);
-        const ang = Math.atan2(dy, dx);
-        ctx.arc(lx + Math.cos(ang)*dist, ly + Math.sin(ang)*dist, knobR, 0, Math.PI*2);
-      } else {
-        ctx.arc(lx, ly, knobR, 0, Math.PI*2);
-      }
+      ctx.fillStyle = "#22c55e"; ctx.beginPath();
+      if (mj) { const dx = mj.currentX - mj.startX, dy = mj.currentY - mj.startY; const dist = Math.min(Math.hypot(dx, dy), jRadius * 0.6); const ang = Math.atan2(dy, dx); ctx.arc(lx + Math.cos(ang)*dist, ly + Math.sin(ang)*dist, knobR, 0, Math.PI*2); } else { ctx.arc(lx, ly, knobR, 0, Math.PI*2); }
       ctx.fill();
-
-      // Right joystick (aim + fire)
       const rx = W * 0.8, ry = H * 0.75;
       const aj = aimJoystickRef.current;
-
       ctx.beginPath(); ctx.arc(rx, ry, jRadius, 0, Math.PI*2);
       ctx.strokeStyle = "#ef4444"; ctx.lineWidth = 2; ctx.stroke();
-      ctx.fillStyle = "#ef4444";
-      ctx.beginPath();
-      if (aj) {
-        const dx = aj.currentX - aj.startX;
-        const dy = aj.currentY - aj.startY;
-        const dist = Math.min(Math.hypot(dx, dy), jRadius * 0.6);
-        const ang = Math.atan2(dy, dx);
-        ctx.arc(rx + Math.cos(ang)*dist, ry + Math.sin(ang)*dist, knobR, 0, Math.PI*2);
-      } else {
-        ctx.arc(rx, ry, knobR, 0, Math.PI*2);
-      }
+      ctx.fillStyle = "#ef4444"; ctx.beginPath();
+      if (aj) { const dx = aj.currentX - aj.startX, dy = aj.currentY - aj.startY; const dist = Math.min(Math.hypot(dx, dy), jRadius * 0.6); const ang = Math.atan2(dy, dx); ctx.arc(rx + Math.cos(ang)*dist, ry + Math.sin(ang)*dist, knobR, 0, Math.PI*2); } else { ctx.arc(rx, ry, knobR, 0, Math.PI*2); }
       ctx.fill();
-
-      // Labels
       ctx.globalAlpha = 0.35;
       ctx.fillStyle = "#fff"; ctx.font = `${Math.round(jRadius*0.3)}px 'Courier New'`; ctx.textAlign = "center";
       ctx.fillText("MOVE", lx, ly + jRadius + jRadius*0.4);
       ctx.fillText("AIM/FIRE", rx, ry + jRadius + jRadius*0.4);
       ctx.textAlign = "left";
-
       ctx.globalAlpha = 1;
     }
 
@@ -981,33 +972,55 @@ export default function TankWars() {
       const mode=modeRef.current;
       const walls=getWalls();
 
-      if(mode==="2p"&&s.roundOver){
+      const is2PLike = mode==="2p" || mode==="online";
+
+      if(is2PLike && s.roundOver){
         s.roundOverTimer-=16;
         if(s.roundOverTimer<=0){
           if(p1WinsRef.current>=3||p2WinsRef.current>=3){
             const winner=p1WinsRef.current>=3?"Player 1 Wins!":"Player 2 Wins!";
+            if(mode==="online") cleanupOnlineRoom();
             setScreen("over"); setOverData({title:winner,score:0,best:0,coins:0}); return;
           }
           resetPvPRound();
         }
       } else {
-        movePlayer(s.p1,"p1",keys["w"],keys["s"],keys["a"],keys["d"],keys[" "],keys["shift"],ts);
-        if(s.p2) movePlayer(s.p2,"p2",keys["arrowup"],keys["arrowdown"],keys["arrowleft"],keys["arrowright"],keys["enter"],keys["rshift"],ts);
+        // Online: only move your own tank locally
+        if(mode==="online") {
+          const role = onlineRoleRef.current;
+          if(role==="host") {
+            movePlayer(s.p1,"p1",keys["w"],keys["s"],keys["a"],keys["d"],keys[" "],keys["shift"],ts);
+          } else {
+            // Guest controls p2 with arrow keys
+            movePlayer(s.p2,"p2",keys["arrowup"],keys["arrowdown"],keys["arrowleft"],keys["arrowright"],keys["enter"],keys["rshift"],ts);
+          }
+          // Broadcast local state ~30fps
+          if(ts - lastSentRef.current > 33 && onlinePvpRef.current?.channel) {
+            const channel = onlinePvpRef.current.channel;
+            if(role==="host") {
+              const myBullets = s.bullets.filter(b=>b.shooterId==="p1"&&!b.remote).map(b=>({ x:b.x,y:b.y,angle:b.angle,life:b.life,maxLife:b.maxLife,size:b.size,color:b.color,damage:b.damage,shooterId:b.shooterId,ghost:b.ghost,pierce:b.pierce,explosive:b.explosive,cryo:b.cryo }));
+              channel.send("state",{ p1:{ x:s.p1.x,y:s.p1.y,angle:s.p1.angle,hp:s.p1.hp,maxHp:s.p1.maxHp,vx:s.p1.vx,vy:s.p1.vy }, bullets:myBullets });
+            } else {
+              const myBullets = s.bullets.filter(b=>b.shooterId==="p2"&&!b.remote).map(b=>({ x:b.x,y:b.y,angle:b.angle,life:b.life,maxLife:b.maxLife,size:b.size,color:b.color,damage:b.damage,shooterId:b.shooterId,ghost:b.ghost,pierce:b.pierce,explosive:b.explosive,cryo:b.cryo }));
+              channel.send("state",{ p2:{ x:s.p2.x,y:s.p2.y,angle:s.p2.angle,hp:s.p2.hp,maxHp:s.p2.maxHp,vx:s.p2.vx,vy:s.p2.vy }, bullets:myBullets });
+            }
+            lastSentRef.current = ts;
+          }
+        } else {
+          movePlayer(s.p1,"p1",keys["w"],keys["s"],keys["a"],keys["d"],keys[" "],keys["shift"],ts);
+          if(s.p2) movePlayer(s.p2,"p2",keys["arrowup"],keys["arrowdown"],keys["arrowleft"],keys["arrowright"],keys["enter"],keys["rshift"],ts);
+        }
 
         if(mode==="survival"){
-          s.enemies.forEach(e=>{
-            updateEnemyAI(e, s.p1, ts, walls, W, H);
-          });
+          s.enemies.forEach(e=>{ updateEnemyAI(e, s.p1, ts, walls, W, H); });
         }
 
         s.bullets.forEach(b=>updateBullet(b));
 
         s.bullets.forEach(b=>{
           if(b.life<=0) return;
-
           if(b.shooterId==="p1"||b.shooterId==="p2"){
             const target=b.shooterId==="p1"?s.p2:s.p1;
-
             s.enemies.forEach(e=>{
               if(b.pierce&&b.pierced.includes(e)) return;
               if(Math.hypot(b.x-e.x,b.y-e.y)<(b.size+12)){
@@ -1020,59 +1033,32 @@ export default function TankWars() {
                 spawnParticles(b.x,b.y,b.isCrit?"#fde68a":b.color,b.isCrit?12:5);
               }
             });
-
             if(target&&target.hp>0&&Math.hypot(b.x-target.x,b.y-target.y)<15){
-              if(target.hasBarrier&&target.barrierCd<=0){
-                target.barrierCd=300;
-                spawnParticles(b.x,b.y,"#60a5fa",8);
-                b.life=0;
-              } else if(target.reflectChance>0&&Math.random()<target.reflectChance){
-                b.angle+=Math.PI;
-                b.shooterId=b.shooterId==="p1"?"p2":"p1";
-                spawnParticles(b.x,b.y,"#22d3ee",5);
-              } else {
-                const dmg=b.damage*(1-(target.damageReduction||0));
-                target.hp-=dmg;
-                if(b.cryo) target.slowTimer=120;
-                if(b.explosive) spawnExplosion(b.x,b.y);
-                b.life=0;
-              }
+              if(target.hasBarrier&&target.barrierCd<=0){ target.barrierCd=300; spawnParticles(b.x,b.y,"#60a5fa",8); b.life=0; }
+              else if(target.reflectChance>0&&Math.random()<target.reflectChance){ b.angle+=Math.PI; b.shooterId=b.shooterId==="p1"?"p2":"p1"; spawnParticles(b.x,b.y,"#22d3ee",5); }
+              else { const dmg=b.damage*(1-(target.damageReduction||0)); target.hp-=dmg; if(b.cryo) target.slowTimer=120; if(b.explosive) spawnExplosion(b.x,b.y); b.life=0; }
             }
-
           } else if(b.shooterId==="enemy"){
-            if(b.explosive&&Math.hypot(b.x-s.p1.x,b.y-s.p1.y)<55){
-              s.p1.hp-=b.damage*0.5*(1-(s.p1.damageReduction||0));
-              spawnExplosion(b.x,b.y);b.life=0;
-            }
+            if(b.explosive&&Math.hypot(b.x-s.p1.x,b.y-s.p1.y)<55){ s.p1.hp-=b.damage*0.5*(1-(s.p1.damageReduction||0)); spawnExplosion(b.x,b.y); b.life=0; }
             if(b.life>0&&s.p1.hp>0&&Math.hypot(b.x-s.p1.x,b.y-s.p1.y)<15){
-              if(s.p1.hasBarrier&&s.p1.barrierCd<=0){
-                s.p1.barrierCd=300;spawnParticles(b.x,b.y,"#60a5fa",8);b.life=0;
-              } else if(s.p1.reflectChance>0&&Math.random()<s.p1.reflectChance){
-                b.angle+=Math.PI;b.shooterId="p1_reflect";spawnParticles(b.x,b.y,"#22d3ee",5);
-              } else {
-                const dmg=b.damage*(1-(s.p1.damageReduction||0));
-                s.p1.hp-=dmg;if(b.explosive) spawnExplosion(b.x,b.y);b.life=0;
-              }
+              if(s.p1.hasBarrier&&s.p1.barrierCd<=0){ s.p1.barrierCd=300; spawnParticles(b.x,b.y,"#60a5fa",8); b.life=0; }
+              else if(s.p1.reflectChance>0&&Math.random()<s.p1.reflectChance){ b.angle+=Math.PI; b.shooterId="p1_reflect"; spawnParticles(b.x,b.y,"#22d3ee",5); }
+              else { const dmg=b.damage*(1-(s.p1.damageReduction||0)); s.p1.hp-=dmg; if(b.explosive) spawnExplosion(b.x,b.y); b.life=0; }
             }
           } else if(b.shooterId==="p1_reflect"){
-            s.enemies.forEach(e=>{
-              if(Math.hypot(b.x-e.x,b.y-e.y)<(b.size+10)){e.hp-=b.damage*2;b.life=0;}
-            });
+            s.enemies.forEach(e=>{ if(Math.hypot(b.x-e.x,b.y-e.y)<(b.size+10)){e.hp-=b.damage*2;b.life=0;} });
           }
         });
 
         s.explosions.forEach(ex=>{
           if(ex.life===ex.maxLife) s.enemies.forEach(e=>{if(Math.hypot(e.x-ex.x,e.y-ex.y)<ex.maxR) e.hp-=15;});
-          ex.r+=(ex.maxR-ex.r)*0.3;ex.life--;
+          ex.r+=(ex.maxR-ex.r)*0.3; ex.life--;
         });
         s.explosions=s.explosions.filter(e=>e.life>0);
 
         const before=s.enemies.length;
         s.enemies=s.enemies.filter(e=>{
-          if(e.hp<=0){
-            spawnParticles(e.x,e.y,e.isBoss?"#fbbf24":e.isElite?"#f87171":"#f97316",e.isBoss?24:e.isElite?16:10);
-            return false;
-          }
+          if(e.hp<=0){ spawnParticles(e.x,e.y,e.isBoss?"#fbbf24":e.isElite?"#f87171":"#f97316",e.isBoss?24:e.isElite?16:10); return false; }
           return true;
         });
         const killed=before-s.enemies.length;
@@ -1096,14 +1082,14 @@ export default function TankWars() {
           return;
         }
 
-        if(mode==="2p"&&!s.roundOver){
-          const p1Dead=s.p1.hp<=0,p2Dead=s.p2&&s.p2.hp<=0;
+        if(is2PLike&&!s.roundOver){
+          const p1Dead=s.p1.hp<=0, p2Dead=s.p2&&s.p2.hp<=0;
           if(p1Dead||p2Dead){
             if(p1Dead) spawnParticles(s.p1.x,s.p1.y,s.p1.color);
             if(p2Dead) spawnParticles(s.p2.x,s.p2.y,s.p2.color);
             if(!p1Dead) p1WinsRef.current++;
             else if(!p2Dead) p2WinsRef.current++;
-            s.roundOver=true;s.roundOverTimer=2200;
+            s.roundOver=true; s.roundOverTimer=2200;
             s.roundWinner=p1Dead&&p2Dead?"Draw!":p1Dead?"P2 wins the round!":"P1 wins the round!";
           }
         }
@@ -1112,8 +1098,8 @@ export default function TankWars() {
           if(scoreRef.current>highScoreRef.current) highScoreRef.current=scoreRef.current;
           const earned=Math.round(waveRef.current*20);
           setCoins(c=>c+earned);
-          const lb=addLeaderboardEntry(scoreRef.current,waveRef.current,equippedSkin);
-          setLeaderboard(lb);
+          // Submit to Supabase leaderboard
+          submitScore(username||"Anonymous", scoreRef.current, waveRef.current, equippedSkin).then(lb=>setLeaderboard(lb||[]));
           setScreen("over");
           setOverData({title:"Game Over",score:scoreRef.current,best:highScoreRef.current,wave:waveRef.current,coins:earned});
           return;
@@ -1122,26 +1108,22 @@ export default function TankWars() {
 
       // ── DRAW ──────────────────────────────────────────────────────────────
       ctx.fillStyle=map.bg; ctx.fillRect(0,0,W,H);
-
       ctx.strokeStyle=map.grid; ctx.lineWidth=0.8;
       const gSz=Math.round(W/20);
       for(let x=0;x<W;x+=gSz){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
       for(let y=0;y<H;y+=gSz){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
-
       ctx.strokeStyle=map.border; ctx.lineWidth=BORDER*2; ctx.strokeRect(0,0,W,H);
 
       walls.forEach(w=>{
         ctx.fillStyle=map.border||"#1e293b";
         ctx.beginPath(); roundRect(ctx,w.x,w.y,w.w,w.h,4); ctx.fill();
-        ctx.fillStyle="rgba(255,255,255,0.08)";
-        ctx.fillRect(w.x,w.y,w.w,Math.min(5,w.h));
-        ctx.fillStyle="rgba(0,0,0,0.3)";
-        ctx.fillRect(w.x,w.y+w.h-Math.min(4,w.h),w.w,Math.min(4,w.h));
+        ctx.fillStyle="rgba(255,255,255,0.08)"; ctx.fillRect(w.x,w.y,w.w,Math.min(5,w.h));
+        ctx.fillStyle="rgba(0,0,0,0.3)"; ctx.fillRect(w.x,w.y+w.h-Math.min(4,w.h),w.w,Math.min(4,w.h));
         ctx.strokeStyle="rgba(255,255,255,0.05)"; ctx.lineWidth=1;
         ctx.beginPath(); roundRect(ctx,w.x,w.y,w.w,w.h,4); ctx.stroke();
       });
 
-      stateRef.current.explosions.forEach(ex=>{
+      s.explosions.forEach(ex=>{
         const g=ctx.createRadialGradient(ex.x,ex.y,0,ex.x,ex.y,ex.r);
         g.addColorStop(0,`rgba(255,200,50,${0.7*(ex.life/ex.maxLife)})`);
         g.addColorStop(0.5,`rgba(255,100,20,${0.4*(ex.life/ex.maxLife)})`);
@@ -1149,35 +1131,31 @@ export default function TankWars() {
         ctx.fillStyle=g; ctx.beginPath(); ctx.arc(ex.x,ex.y,ex.r,0,Math.PI*2); ctx.fill();
       });
 
-      stateRef.current.particles.forEach(p=>{
+      s.particles.forEach(p=>{
         ctx.globalAlpha=p.life/p.maxLife;
         ctx.fillStyle=p.color;
         ctx.beginPath(); ctx.arc(p.x,p.y,p.size||2,0,Math.PI*2); ctx.fill();
       });
       ctx.globalAlpha=1;
 
-      const showLabels=modeRef.current==="2p";
-      const st=stateRef.current;
-      if(st.p1.hp>0) drawTank(st.p1,showLabels?"P1":null);
-      if(st.p2&&st.p2.hp>0) drawTank(st.p2,showLabels?"P2":null);
-      st.enemies.forEach(e=>{
+      const showLabels=is2PLike;
+      if(s.p1.hp>0) drawTank(s.p1,showLabels?"P1":null);
+      if(s.p2&&s.p2.hp>0) drawTank(s.p2,showLabels?"P2":null);
+      s.enemies.forEach(e=>{
         if(e.isBoss){
           ctx.save(); ctx.translate(e.x,e.y);
-          ctx.beginPath(); ctx.arc(0,0,32,0,Math.PI*2);
-          ctx.strokeStyle="rgba(251,191,36,0.5)"; ctx.lineWidth=3; ctx.stroke();
-          ctx.beginPath(); ctx.arc(0,0,36,0,Math.PI*2);
-          ctx.strokeStyle="rgba(251,191,36,0.2)"; ctx.lineWidth=2; ctx.stroke();
+          ctx.beginPath(); ctx.arc(0,0,32,0,Math.PI*2); ctx.strokeStyle="rgba(251,191,36,0.5)"; ctx.lineWidth=3; ctx.stroke();
+          ctx.beginPath(); ctx.arc(0,0,36,0,Math.PI*2); ctx.strokeStyle="rgba(251,191,36,0.2)"; ctx.lineWidth=2; ctx.stroke();
           ctx.restore();
         } else if(e.isElite){
           ctx.save(); ctx.translate(e.x,e.y);
-          ctx.beginPath(); ctx.arc(0,0,28,0,Math.PI*2);
-          ctx.strokeStyle="rgba(251,191,36,0.35)"; ctx.lineWidth=2; ctx.stroke();
+          ctx.beginPath(); ctx.arc(0,0,28,0,Math.PI*2); ctx.strokeStyle="rgba(251,191,36,0.35)"; ctx.lineWidth=2; ctx.stroke();
           ctx.restore();
         }
         drawTank(e,null);
       });
 
-      st.bullets.forEach(b=>{
+      s.bullets.forEach(b=>{
         const ageFrac=b.life/b.maxLife;
         ctx.globalAlpha=Math.min(1,ageFrac*3);
         if(b.ghost||b.explosive||b.isCrit){ctx.shadowBlur=b.isCrit?20:b.explosive?16:10;ctx.shadowColor=b.isCrit?"#fde68a":b.color;}
@@ -1189,38 +1167,35 @@ export default function TankWars() {
       });
       ctx.globalAlpha=1;
 
-      if(modeRef.current==="survival"){
+      if(mode==="survival"){
         ctx.fillStyle="rgba(0,0,0,0.5)"; ctx.fillRect(W/2-80,8,160,22);
         ctx.fillStyle="#facc15"; ctx.font=`bold ${Math.round(W/65)}px 'Courier New'`; ctx.textAlign="center";
         ctx.fillText(`◆ Wave ${waveRef.current} — ${map.name} ◆`,W/2,23); ctx.textAlign="left";
       }
-      if(modeRef.current==="2p"){
+      if(is2PLike){
         ctx.fillStyle="rgba(0,0,0,0.6)"; ctx.fillRect(W/2-110,8,220,24);
         ctx.font="bold 13px 'Courier New'"; ctx.textAlign="center";
-        ctx.fillStyle=st.p1.color; ctx.fillText(`P1 ${p1WinsRef.current}`,W/2-44,24);
+        ctx.fillStyle=s.p1.color; ctx.fillText(`P1 ${p1WinsRef.current}`,W/2-44,24);
         ctx.fillStyle="#444"; ctx.fillText("—",W/2,24);
-        ctx.fillStyle=st.p2?.color||"#e879f9"; ctx.fillText(`${p2WinsRef.current} P2`,W/2+44,24);
+        ctx.fillStyle=s.p2?.color||"#e879f9"; ctx.fillText(`${p2WinsRef.current} P2`,W/2+44,24);
         ctx.textAlign="left";
-        if(st.roundOver){
+        if(s.roundOver){
           ctx.fillStyle="rgba(0,0,0,0.75)"; ctx.fillRect(W/2-150,H/2-36,300,68);
           ctx.fillStyle="#facc15"; ctx.font="bold 22px 'Courier New'"; ctx.textAlign="center";
-          ctx.fillText(st.roundWinner,W/2,H/2-4);
+          ctx.fillText(s.roundWinner,W/2,H/2-4);
           ctx.fillStyle="#555"; ctx.font="12px 'Courier New'";
           ctx.fillText("Next round starting...",W/2,H/2+22); ctx.textAlign="left";
         }
       }
 
-      // Draw mobile joystick overlay on canvas
-      if(isMobileRef.current) {
-        drawMobileControls();
-      }
+      if(isMobileRef.current) drawMobileControls();
 
       if(ts-lastHudUpdate>100){
         lastHudUpdate=ts;
         setHudData({
-          hp1:Math.max(0,Math.round(st.p1.hp)),maxHp1:st.p1.maxHp,
-          hp2:st.p2?Math.max(0,Math.round(st.p2.hp)):0,maxHp2:st.p2?st.p2.maxHp:100,
-          score:scoreRef.current,wave:waveRef.current,mode:modeRef.current,
+          hp1:Math.max(0,Math.round(s.p1.hp)),maxHp1:s.p1.maxHp,
+          hp2:s.p2?Math.max(0,Math.round(s.p2.hp)):0,maxHp2:s.p2?s.p2.maxHp:100,
+          score:scoreRef.current,wave:waveRef.current,mode,
         });
       }
 
@@ -1242,26 +1217,12 @@ export default function TankWars() {
       <svg width={size} height={Math.round(56*scale)} viewBox="0 0 70 56">
         <rect x="8" y="4" width="54" height="8" fill={s.tread} rx="3"/>
         <rect x="8" y="44" width="54" height="8" fill={s.tread} rx="3"/>
-        {[14,22,30,38,46,54].map(x=>(
-          <g key={x}>
-            <line x1={x} y1="4" x2={x} y2="12" stroke="rgba(255,255,255,0.18)" strokeWidth="0.8"/>
-            <line x1={x} y1="44" x2={x} y2="52" stroke="rgba(255,255,255,0.18)" strokeWidth="0.8"/>
-          </g>
-        ))}
-        {[14,24,35,46,56].map(wx=>(
-          <g key={wx}>
-            <circle cx={wx} cy="8" r="3.5" fill="rgba(0,0,0,0.5)"/>
-            <circle cx={wx} cy="8" r="2.2" stroke="rgba(255,255,255,0.2)" strokeWidth="0.7" fill="none"/>
-            <circle cx={wx} cy="48" r="3.5" fill="rgba(0,0,0,0.5)"/>
-            <circle cx={wx} cy="48" r="2.2" stroke="rgba(255,255,255,0.2)" strokeWidth="0.7" fill="none"/>
-          </g>
-        ))}
+        {[14,22,30,38,46,54].map(x=>(<g key={x}><line x1={x} y1="4" x2={x} y2="12" stroke="rgba(255,255,255,0.18)" strokeWidth="0.8"/><line x1={x} y1="44" x2={x} y2="52" stroke="rgba(255,255,255,0.18)" strokeWidth="0.8"/></g>))}
+        {[14,24,35,46,56].map(wx=>(<g key={wx}><circle cx={wx} cy="8" r="3.5" fill="rgba(0,0,0,0.5)"/><circle cx={wx} cy="8" r="2.2" stroke="rgba(255,255,255,0.2)" strokeWidth="0.7" fill="none"/><circle cx={wx} cy="48" r="3.5" fill="rgba(0,0,0,0.5)"/><circle cx={wx} cy="48" r="2.2" stroke="rgba(255,255,255,0.2)" strokeWidth="0.7" fill="none"/></g>))}
         <rect x="13" y="13" width="44" height="30" fill={s.body} rx="4"/>
         <line x1="16" y1="28" x2="54" y2="28" stroke="rgba(0,0,0,0.3)" strokeWidth="1"/>
         <rect x="13" y="13" width="44" height="15" fill="rgba(255,255,255,0.18)" rx="4" opacity="0.8"/>
-        {[[17,17],[53,17],[17,39],[53,39]].map(([bx,by],i)=>(
-          <circle key={i} cx={bx} cy={by} r="1.5" fill="rgba(0,0,0,0.35)"/>
-        ))}
+        {[[17,17],[53,17],[17,39],[53,39]].map(([bx,by],i)=>(<circle key={i} cx={bx} cy={by} r="1.5" fill="rgba(0,0,0,0.35)"/>))}
         <circle cx="35" cy="28" r="9" fill="rgba(0,0,0,0.4)"/>
         <circle cx="35" cy="28" r="8" fill={s.barrel}/>
         <circle cx="33" cy="26" r="4" fill="rgba(255,255,255,0.15)"/>
@@ -1277,28 +1238,8 @@ export default function TankWars() {
   const styles = {
     root: { position:"fixed",inset:0,background:"#05050e",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",fontFamily:"'Courier New',monospace",userSelect:"none",overflow:"hidden",touchAction:"none" },
     btn: { padding:"10px 28px",background:"transparent",border:"1.5px solid #1e293b",borderRadius:10,color:"#94a3b8",cursor:"pointer",fontSize:13,fontFamily:"'Courier New'",letterSpacing:"0.08em",transition:"all 0.18s" },
+    input: { background:"rgba(255,255,255,0.05)",border:"1.5px solid #1e293b",borderRadius:10,color:"#f8fafc",fontSize:15,fontFamily:"'Courier New'",letterSpacing:"0.08em",padding:"10px 16px",outline:"none",width:"100%",boxSizing:"border-box",transition:"border-color 0.2s" },
   };
-
-  // Mobile-friendly tap handler (no hover effects needed)
-  const mobileCard = (onClick, color, children, extraStyle={}) => (
-    <div
-      onClick={onClick}
-      onTouchStart={e=>{ e.currentTarget.style.transform="scale(0.96)"; }}
-      onTouchEnd={e=>{ e.currentTarget.style.transform=""; onClick && onClick(); }}
-      style={{
-        padding:"18px 14px",
-        background:`rgba(${color},0.04)`,
-        border:`1.5px solid rgba(${color},0.25)`,
-        borderRadius:16,cursor:"pointer",
-        transition:"transform 0.12s",
-        display:"flex",flexDirection:"column",alignItems:"center",gap:10,
-        WebkitTapHighlightColor:"transparent",
-        ...extraStyle
-      }}
-    >
-      {children}
-    </div>
-  );
 
   return (
     <div style={styles.root}>
@@ -1310,12 +1251,47 @@ export default function TankWars() {
         ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}
         * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
         button { touch-action: manipulation; }
+        input:focus { border-color: #22c55e !important; }
       `}</style>
 
-      {screen!=="menu"&&screen!=="game"&&(
+      {screen!=="menu"&&screen!=="game"&&screen!=="username"&&(
         <div style={{position:"fixed",top:16,right:20,background:"rgba(0,0,0,0.7)",border:"1px solid #1e293b",borderRadius:8,padding:"6px 14px",fontSize:13,color:"#facc15",zIndex:100}}>◆ {coins.toLocaleString()}</div>
       )}
 
+      {/* ── USERNAME ENTRY ─────────────────────────────────────────────────── */}
+      {screen==="username"&&(
+        <div className="fade-in" style={{display:"flex",flexDirection:"column",alignItems:"center",gap:28,padding:"0 24px",maxWidth:420,width:"100%"}}>
+          <div style={{textAlign:"center"}}>
+            <div style={{fontSize:10,letterSpacing:"0.5em",color:"#1e3a5f",marginBottom:10}}>◆ TACTICAL ARENA ◆</div>
+            <div style={{display:"flex",gap:0,justifyContent:"center"}}>
+              <h1 style={{fontSize:"clamp(40px,10vw,72px)",fontWeight:900,letterSpacing:"0.12em",margin:0,lineHeight:0.95,background:"linear-gradient(135deg,#22c55e,#4ade80,#86efac)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",backgroundSize:"200%",animation:"shimmer 4s linear infinite"}}>TANK</h1>
+              <h1 style={{fontSize:"clamp(40px,10vw,72px)",fontWeight:900,letterSpacing:"0.12em",margin:0,lineHeight:0.95,color:"#1e293b",WebkitTextStroke:"2px #1e3a5f"}}>&nbsp;WARS</h1>
+            </div>
+          </div>
+          <div style={{width:"100%",display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{fontSize:11,color:"#475569",letterSpacing:"0.12em",textAlign:"center"}}>ENTER YOUR CALLSIGN</div>
+            <input
+              style={styles.input}
+              placeholder="Commander name..."
+              maxLength={20}
+              value={usernameInput}
+              onChange={e=>setUsernameInput(e.target.value)}
+              onKeyDown={e=>{ if(e.key==="Enter"&&usernameInput.trim()){ setUsername(usernameInput.trim()); setScreen("menu"); }}}
+              autoFocus
+            />
+            <button
+              onClick={()=>{ if(usernameInput.trim()){ setUsername(usernameInput.trim()); setScreen("menu"); }}}
+              disabled={!usernameInput.trim()}
+              style={{...styles.btn,background:usernameInput.trim()?"rgba(34,197,94,0.1)":"transparent",borderColor:usernameInput.trim()?"#22c55e":"#1e293b",color:usernameInput.trim()?"#22c55e":"#334155",fontSize:14,letterSpacing:"0.2em",padding:"12px 0",width:"100%",cursor:usernameInput.trim()?"pointer":"default"}}
+            >
+              ▶ ENTER BATTLE
+            </button>
+          </div>
+          <div style={{fontSize:10,color:"#1e293b",letterSpacing:"0.06em",textAlign:"center"}}>No account required · Scores go to global leaderboard</div>
+        </div>
+      )}
+
+      {/* ── MAIN MENU ──────────────────────────────────────────────────────── */}
       {screen==="menu"&&(
         <div className="fade-in" style={{display:"flex",flexDirection:"column",alignItems:"center",width:"100%",maxWidth:760,padding:"0 16px",gap:0,overflowY:"auto",maxHeight:"100vh"}}>
           <div style={{textAlign:"center",marginBottom:isMobile?16:36,marginTop:isMobile?12:0}}>
@@ -1324,6 +1300,7 @@ export default function TankWars() {
               <h1 style={{fontSize:`clamp(${isMobile?"32px":"48px"},8vw,80px)`,fontWeight:900,letterSpacing:"0.12em",margin:0,lineHeight:0.95,background:"linear-gradient(135deg,#22c55e,#4ade80,#86efac)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",backgroundSize:"200%",animation:"shimmer 4s linear infinite"}}>TANK</h1>
               <h1 style={{fontSize:`clamp(${isMobile?"32px":"48px"},8vw,80px)`,fontWeight:900,letterSpacing:"0.12em",margin:0,lineHeight:0.95,color:"#1e293b",WebkitTextStroke:"2px #1e3a5f"}}>&nbsp;WARS</h1>
             </div>
+            <div style={{fontSize:10,color:"#334155",marginTop:6}}>Commander: <span style={{color:"#22c55e"}}>{username}</span></div>
           </div>
 
           <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:isMobile?16:28,background:"rgba(250,204,21,0.07)",border:"1px solid rgba(250,204,21,0.15)",borderRadius:10,padding:"8px 20px"}}>
@@ -1332,8 +1309,8 @@ export default function TankWars() {
             <span style={{fontSize:11,color:"#64748b",marginLeft:4}}>COINS</span>
           </div>
 
-          {/* On mobile: 2-column grid for mode buttons */}
-          <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(auto-fit,minmax(180px,1fr))",gap:isMobile?10:14,marginBottom:isMobile?16:24,width:"100%"}}>
+          <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(auto-fit,minmax(175px,1fr))",gap:isMobile?10:14,marginBottom:isMobile?16:24,width:"100%"}}>
+            {/* Survival */}
             <div onClick={startSurvival} onMouseEnter={()=>!isMobile&&setHoveredMode("survival")} onMouseLeave={()=>!isMobile&&setHoveredMode(null)}
               style={{padding:isMobile?"16px 10px":"22px 18px",background:hoveredMode==="survival"?"rgba(34,197,94,0.06)":"rgba(255,255,255,0.02)",border:`1.5px solid ${hoveredMode==="survival"?"#22c55e":"#0f172a"}`,borderRadius:16,cursor:"pointer",transition:"all 0.2s ease",transform:hoveredMode==="survival"?"translateY(-6px)":"none",display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?8:12,WebkitTapHighlightColor:"transparent"}}>
               <div style={{fontSize:isMobile?24:30}}>🎯</div>
@@ -1341,15 +1318,16 @@ export default function TankWars() {
                 <div style={{fontSize:isMobile?14:18,fontWeight:900,letterSpacing:"0.1em",color:hoveredMode==="survival"?"#22c55e":"#e2e8f0"}}>SURVIVAL</div>
                 {!isMobile&&<div style={{fontSize:10,color:"#475569",marginTop:2}}>RANDOM MAP EACH RUN</div>}
               </div>
-              {!isMobile&&<div style={{fontSize:11,color:"#64748b",textAlign:"center",lineHeight:1.7}}>Endless waves. Random arena every run.</div>}
+              {!isMobile&&<div style={{fontSize:11,color:"#64748b",textAlign:"center",lineHeight:1.7}}>Endless waves. Upgrades. Global leaderboard.</div>}
             </div>
 
+            {/* Local PvP */}
             <div onMouseEnter={()=>!isMobile&&setHoveredMode("2p")} onMouseLeave={()=>!isMobile&&setHoveredMode(null)}
               style={{padding:isMobile?"16px 10px":"22px 18px",background:hoveredMode==="2p"?"rgba(232,121,249,0.06)":"rgba(255,255,255,0.02)",border:`1.5px solid ${hoveredMode==="2p"?"#e879f9":"#0f172a"}`,borderRadius:16,transition:"all 0.2s ease",display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?8:10,WebkitTapHighlightColor:"transparent"}}>
               <div style={{fontSize:isMobile?24:30}}>⚔️</div>
               <div style={{textAlign:"center"}}>
-                <div style={{fontSize:isMobile?14:18,fontWeight:900,letterSpacing:"0.1em",color:hoveredMode==="2p"?"#e879f9":"#e2e8f0"}}>PvP</div>
-                {!isMobile&&<div style={{fontSize:10,color:"#475569",marginTop:2}}>CHOOSE YOUR ARENA</div>}
+                <div style={{fontSize:isMobile?14:18,fontWeight:900,letterSpacing:"0.1em",color:hoveredMode==="2p"?"#e879f9":"#e2e8f0"}}>LOCAL PvP</div>
+                {!isMobile&&<div style={{fontSize:10,color:"#475569",marginTop:2}}>SAME KEYBOARD</div>}
               </div>
               {isMobile?(
                 <button onClick={start2P} style={{fontSize:11,color:"#e879f9",background:"rgba(232,121,249,0.1)",border:"1.5px solid #e879f9",borderRadius:10,padding:"6px 16px",cursor:"pointer",fontFamily:"'Courier New'",touchAction:"manipulation"}}>▶ PLAY</button>
@@ -1368,21 +1346,34 @@ export default function TankWars() {
               )}
             </div>
 
+            {/* Online PvP */}
+            <div onClick={()=>setScreen("online")} onMouseEnter={()=>!isMobile&&setHoveredMode("online")} onMouseLeave={()=>!isMobile&&setHoveredMode(null)}
+              style={{padding:isMobile?"16px 10px":"22px 18px",background:hoveredMode==="online"?"rgba(56,189,248,0.06)":"rgba(255,255,255,0.02)",border:`1.5px solid ${hoveredMode==="online"?"#38bdf8":"#0f172a"}`,borderRadius:16,cursor:"pointer",transition:"all 0.2s ease",transform:hoveredMode==="online"?"translateY(-6px)":"none",display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?8:12,WebkitTapHighlightColor:"transparent"}}>
+              <div style={{fontSize:isMobile?24:30}}>🌐</div>
+              <div style={{textAlign:"center"}}>
+                <div style={{fontSize:isMobile?14:18,fontWeight:900,letterSpacing:"0.1em",color:hoveredMode==="online"?"#38bdf8":"#e2e8f0"}}>ONLINE PvP</div>
+                {!isMobile&&<div style={{fontSize:10,color:"#475569",marginTop:2}}>PLAY ANYWHERE</div>}
+              </div>
+              {!isMobile&&<div style={{fontSize:11,color:"#64748b",textAlign:"center",lineHeight:1.7}}>Share a room code with a friend.</div>}
+            </div>
+
+            {/* Shop */}
             <div onClick={()=>setScreen("shop")} onMouseEnter={()=>!isMobile&&setHoveredMode("shop")} onMouseLeave={()=>!isMobile&&setHoveredMode(null)}
               style={{padding:isMobile?"16px 10px":"22px 18px",background:hoveredMode==="shop"?"rgba(245,158,11,0.06)":"rgba(255,255,255,0.02)",border:`1.5px solid ${hoveredMode==="shop"?"#f59e0b":"#0f172a"}`,borderRadius:16,cursor:"pointer",transition:"all 0.2s ease",display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?8:12,WebkitTapHighlightColor:"transparent"}}>
               <div style={{fontSize:isMobile?24:30}}>🛒</div>
               <div style={{textAlign:"center"}}>
                 <div style={{fontSize:isMobile?14:18,fontWeight:900,letterSpacing:"0.1em",color:hoveredMode==="shop"?"#f59e0b":"#e2e8f0"}}>SHOP</div>
-                {!isMobile&&<div style={{fontSize:10,color:"#475569",marginTop:2}}>SKINS & MAPS</div>}
+                {!isMobile&&<div style={{fontSize:10,color:"#475569",marginTop:2}}>TANK SKINS</div>}
               </div>
             </div>
 
-            <div onClick={()=>setScreen("leaderboard")} onMouseEnter={()=>!isMobile&&setHoveredMode("lb")} onMouseLeave={()=>!isMobile&&setHoveredMode(null)}
+            {/* Leaderboard */}
+            <div onClick={()=>{loadLeaderboard();setScreen("leaderboard");}} onMouseEnter={()=>!isMobile&&setHoveredMode("lb")} onMouseLeave={()=>!isMobile&&setHoveredMode(null)}
               style={{padding:isMobile?"16px 10px":"22px 18px",background:hoveredMode==="lb"?"rgba(56,189,248,0.06)":"rgba(255,255,255,0.02)",border:`1.5px solid ${hoveredMode==="lb"?"#38bdf8":"#0f172a"}`,borderRadius:16,cursor:"pointer",transition:"all 0.2s ease",display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?8:12,WebkitTapHighlightColor:"transparent"}}>
               <div style={{fontSize:isMobile?24:30}}>🏆</div>
               <div style={{textAlign:"center"}}>
                 <div style={{fontSize:isMobile?14:18,fontWeight:900,letterSpacing:"0.1em",color:hoveredMode==="lb"?"#38bdf8":"#e2e8f0"}}>SCORES</div>
-                {!isMobile&&<div style={{fontSize:10,color:"#475569",marginTop:2}}>SURVIVAL TOP 10</div>}
+                {!isMobile&&<div style={{fontSize:10,color:"#475569",marginTop:2}}>GLOBAL TOP 10</div>}
               </div>
             </div>
           </div>
@@ -1390,37 +1381,138 @@ export default function TankWars() {
           <div style={{display:"flex",gap:isMobile?10:20,borderTop:"1px solid #0a0a1a",paddingTop:10,paddingBottom:isMobile?12:0,fontSize:isMobile?10:11,color:"#334155",flexWrap:"wrap",justifyContent:"center"}}>
             <span>Skin: <span style={{color:SKINS.find(s=>s.id===equippedSkin)?.body}}>{SKINS.find(s=>s.id===equippedSkin)?.name}</span></span>
             <span style={{color:"#1e293b"}}>·</span>
-            {isMobile&&<span style={{color:"#475569",fontSize:9}}>Left joystick: move · Right joystick: aim/fire</span>}
-            {!isMobile&&<span>Survival: <span style={{color:"#f97316"}}>Random</span></span>}
+            <button onClick={()=>{setUsername("");setUsernameInput("");setScreen("username");}} style={{background:"none",border:"none",color:"#334155",cursor:"pointer",fontFamily:"'Courier New'",fontSize:isMobile?10:11,padding:0}}>Change callsign</button>
+            {isMobile&&<span style={{color:"#475569",fontSize:9,width:"100%",textAlign:"center"}}>Left joystick: move · Right joystick: aim/fire</span>}
           </div>
         </div>
       )}
 
+      {/* ── ONLINE PVP LOBBY ──────────────────────────────────────────────── */}
+      {screen==="online"&&(
+        <div className="fade-in" style={{display:"flex",flexDirection:"column",alignItems:"center",width:"100%",maxWidth:460,padding:"0 16px",gap:20}}>
+          <div style={{display:"flex",alignItems:"center",gap:16,width:"100%",paddingTop:isMobile?12:0}}>
+            <button onClick={()=>{cleanupOnlineRoom();setScreen("menu");}} style={{...styles.btn,fontSize:12,padding:"6px 16px"}}>← Back</button>
+            <div>
+              <div style={{fontSize:isMobile?16:20,fontWeight:900,color:"#38bdf8",letterSpacing:"0.12em"}}>ONLINE PvP</div>
+              <div style={{fontSize:10,color:"#334155",letterSpacing:"0.1em"}}>Playing as <span style={{color:"#22c55e"}}>{username}</span></div>
+            </div>
+          </div>
+
+          {/* Map selector */}
+          <div style={{width:"100%",background:"rgba(255,255,255,0.02)",border:"1px solid #0f172a",borderRadius:12,padding:"14px 16px"}}>
+            <div style={{fontSize:10,color:"#334155",letterSpacing:"0.12em",marginBottom:10}}>SELECT MAP (host decides)</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {MAPS.map(m=>(
+                <button key={m.id} onClick={()=>setPvpMapChoice(m.id)}
+                  style={{fontSize:10,padding:"4px 10px",background:pvpMapChoice===m.id?"rgba(56,189,248,0.15)":"rgba(0,0,0,0.3)",border:`1px solid ${pvpMapChoice===m.id?"#38bdf8":"#1e293b"}`,borderRadius:6,color:pvpMapChoice===m.id?"#38bdf8":"#475569",cursor:"pointer",fontFamily:"'Courier New'",transition:"all 0.15s"}}>
+                  {m.name}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Tab selector */}
+          {!onlineWaiting&&(
+            <div style={{display:"flex",gap:4,background:"#0a0a1a",borderRadius:10,padding:"4px",width:"100%"}}>
+              {["create","join"].map(t=>(
+                <button key={t} onClick={()=>setOnlineTab(t)}
+                  style={{flex:1,padding:"8px",background:onlineTab===t?"rgba(255,255,255,0.07)":"transparent",border:onlineTab===t?"1px solid #1e293b":"1px solid transparent",borderRadius:8,color:onlineTab===t?"#e2e8f0":"#334155",fontSize:12,cursor:"pointer",fontFamily:"'Courier New'",letterSpacing:"0.1em",transition:"all 0.15s"}}>
+                  {t==="create"?"CREATE ROOM":"JOIN ROOM"}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Create Room */}
+          {!onlineWaiting&&onlineTab==="create"&&(
+            <div style={{width:"100%",display:"flex",flexDirection:"column",gap:14}}>
+              <div style={{fontSize:11,color:"#475569",lineHeight:1.8,textAlign:"center"}}>Create a private room and share the code with your opponent. You'll play as <span style={{color:"#22c55e"}}>P1</span> (WASD + Space).</div>
+              <button onClick={createOnlineRoom}
+                style={{...styles.btn,background:"rgba(56,189,248,0.1)",borderColor:"#38bdf8",color:"#38bdf8",fontSize:14,padding:"12px",width:"100%",letterSpacing:"0.15em"}}>
+                🌐 CREATE ROOM
+              </button>
+            </div>
+          )}
+
+          {/* Join Room */}
+          {!onlineWaiting&&onlineTab==="join"&&(
+            <div style={{width:"100%",display:"flex",flexDirection:"column",gap:14}}>
+              <div style={{fontSize:11,color:"#475569",textAlign:"center"}}>Enter the 5-letter room code from your opponent. You'll play as <span style={{color:"#e879f9"}}>P2</span> (Arrows + Enter).</div>
+              <input
+                style={styles.input}
+                placeholder="Room code (e.g. ABCD1)"
+                maxLength={5}
+                value={roomCodeInput}
+                onChange={e=>setRoomCodeInput(e.target.value.toUpperCase())}
+                onKeyDown={e=>e.key==="Enter"&&joinOnlineRoom(roomCodeInput)}
+              />
+              <button onClick={()=>joinOnlineRoom(roomCodeInput)}
+                disabled={roomCodeInput.length!==5}
+                style={{...styles.btn,background:roomCodeInput.length===5?"rgba(232,121,249,0.1)":"transparent",borderColor:roomCodeInput.length===5?"#e879f9":"#1e293b",color:roomCodeInput.length===5?"#e879f9":"#334155",fontSize:14,padding:"12px",width:"100%",letterSpacing:"0.15em",cursor:roomCodeInput.length===5?"pointer":"default"}}>
+                ⚔️ JOIN ROOM
+              </button>
+            </div>
+          )}
+
+          {/* Waiting state */}
+          {onlineWaiting&&(
+            <div style={{width:"100%",display:"flex",flexDirection:"column",alignItems:"center",gap:20}}>
+              {currentRoomCode&&(
+                <div style={{textAlign:"center",background:"rgba(56,189,248,0.05)",border:"1px solid rgba(56,189,248,0.2)",borderRadius:14,padding:"20px 28px",width:"100%"}}>
+                  <div style={{fontSize:10,color:"#334155",letterSpacing:"0.15em",marginBottom:8}}>YOUR ROOM CODE</div>
+                  <div style={{fontSize:36,fontWeight:900,color:"#38bdf8",letterSpacing:"0.3em"}}>{currentRoomCode}</div>
+                  <div style={{fontSize:10,color:"#475569",marginTop:8}}>Share this with your opponent</div>
+                </div>
+              )}
+              <div style={{display:"flex",alignItems:"center",gap:12,color:"#475569",fontSize:13}}>
+                <div style={{width:8,height:8,borderRadius:"50%",background:"#22c55e",animation:"pulse 1.5s infinite"}}/>
+                {onlineStatus}
+              </div>
+              <button onClick={cleanupOnlineRoom} style={{...styles.btn,fontSize:12,color:"#450a0a",borderColor:"#1a0a0a"}}
+                onMouseEnter={e=>{e.currentTarget.style.color="#ef4444";e.currentTarget.style.borderColor="#ef4444";}}
+                onMouseLeave={e=>{e.currentTarget.style.color="#450a0a";e.currentTarget.style.borderColor="#1a0a0a";}}>
+                Cancel
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── LEADERBOARD ───────────────────────────────────────────────────── */}
       {screen==="leaderboard"&&(
         <div className="fade-in" style={{display:"flex",flexDirection:"column",alignItems:"center",width:"100%",maxWidth:600,padding:"0 16px",overflowY:"auto",maxHeight:"100vh"}}>
           <div style={{display:"flex",alignItems:"center",gap:20,padding:`${isMobile?"12px":"0"} 0 20px`,width:"100%"}}>
             <button onClick={()=>setScreen("menu")} style={{...styles.btn,fontSize:12,padding:"6px 16px"}}>← Back</button>
             <div>
               <div style={{fontSize:isMobile?16:20,fontWeight:900,color:"#f8fafc",letterSpacing:"0.12em"}}>LEADERBOARD</div>
-              <div style={{fontSize:10,color:"#334155",letterSpacing:"0.15em"}}>SURVIVAL TOP SCORES</div>
+              <div style={{fontSize:10,color:"#334155",letterSpacing:"0.15em"}}>GLOBAL TOP SCORES</div>
+            </div>
+            <div style={{marginLeft:"auto"}}>
+              <button onClick={loadLeaderboard} style={{...styles.btn,fontSize:11,padding:"5px 14px"}}>{lbLoading?"...":"↻ Refresh"}</button>
             </div>
           </div>
-          {leaderboard.length===0?(
+          {lbLoading?(
+            <div style={{color:"#334155",fontSize:13,marginTop:40,textAlign:"center",animation:"pulse 1.5s infinite"}}>Loading...</div>
+          ):leaderboard.length===0?(
             <div style={{color:"#334155",fontSize:13,marginTop:40,textAlign:"center"}}>No runs recorded yet.<br/><span style={{color:"#475569"}}>Play Survival to get on the board!</span></div>
           ):(
             <div style={{width:"100%",display:"flex",flexDirection:"column",gap:8,paddingBottom:20}}>
               {leaderboard.map((entry,i)=>{
                 const skin=SKINS.find(s=>s.id===entry.skin)||SKINS[0];
                 const medals=["🥇","🥈","🥉"];
+                const isMe = entry.username===username;
                 return (
-                  <div key={i} style={{display:"flex",alignItems:"center",gap:14,background:i===0?"rgba(250,204,21,0.07)":i===1?"rgba(148,163,184,0.05)":i===2?"rgba(180,83,9,0.05)":"rgba(255,255,255,0.02)",border:`1px solid ${i===0?"rgba(250,204,21,0.2)":i<3?"rgba(255,255,255,0.06)":"#0f172a"}`,borderRadius:12,padding:"12px 16px"}}>
+                  <div key={i} style={{display:"flex",alignItems:"center",gap:14,background:isMe?"rgba(34,197,94,0.07)":i===0?"rgba(250,204,21,0.07)":i===1?"rgba(148,163,184,0.05)":i===2?"rgba(180,83,9,0.05)":"rgba(255,255,255,0.02)",border:`1px solid ${isMe?"rgba(34,197,94,0.35)":i===0?"rgba(250,204,21,0.2)":i<3?"rgba(255,255,255,0.06)":"#0f172a"}`,borderRadius:12,padding:"12px 16px"}}>
                     <div style={{fontSize:20,width:28,textAlign:"center"}}>{medals[i]||`#${i+1}`}</div>
                     <div style={{width:40,height:28,display:"flex",alignItems:"center",justifyContent:"center"}}>
                       <MiniTank skin={entry.skin} size={40}/>
                     </div>
                     <div style={{flex:1}}>
-                      <div style={{fontSize:18,fontWeight:900,color:i===0?"#facc15":i===1?"#94a3b8":i===2?"#b45309":"#e2e8f0"}}>{entry.score.toLocaleString()}</div>
-                      <div style={{fontSize:10,color:"#475569"}}>Wave {entry.wave} · {skin.name}</div>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        <div style={{fontSize:18,fontWeight:900,color:isMe?"#22c55e":i===0?"#facc15":i===1?"#94a3b8":i===2?"#b45309":"#e2e8f0"}}>{entry.score?.toLocaleString()}</div>
+                        {isMe&&<span style={{fontSize:8,color:"#22c55e",border:"1px solid #22c55e44",borderRadius:99,padding:"1px 6px",letterSpacing:"0.1em"}}>YOU</span>}
+                      </div>
+                      <div style={{fontSize:10,color:"#475569"}}>{entry.username} · Wave {entry.wave} · {skin.name}</div>
                     </div>
                     <div style={{fontSize:10,color:"#334155"}}>{entry.date}</div>
                   </div>
@@ -1428,124 +1520,64 @@ export default function TankWars() {
               })}
             </div>
           )}
-          <button onClick={()=>{saveLeaderboard([]);setLeaderboard([]);}} style={{...styles.btn,fontSize:10,marginTop:10,marginBottom:20,color:"#450a0a",borderColor:"#1a0a0a"}} onMouseEnter={e=>{e.currentTarget.style.color="#ef4444";e.currentTarget.style.borderColor="#ef4444";}} onMouseLeave={e=>{e.currentTarget.style.color="#450a0a";e.currentTarget.style.borderColor="#1a0a0a";}}>Clear Records</button>
         </div>
       )}
 
+      {/* ── SHOP (Skins only) ─────────────────────────────────────────────── */}
       {screen==="shop"&&(
         <div className="fade-in" style={{display:"flex",flexDirection:"column",alignItems:"center",width:"100%",maxWidth:860,height:"100vh",overflow:"hidden"}}>
-          <div style={{display:"flex",alignItems:"center",gap:isMobile?12:20,padding:`${isMobile?"12px 16px":"20px 24px"} 0`,width:"100%",boxSizing:"border-box",paddingLeft:isMobile?16:24,paddingRight:isMobile?16:24}}>
+          <div style={{display:"flex",alignItems:"center",gap:isMobile?12:20,padding:`${isMobile?"12px 16px":"20px 24px"} 0`,width:"100%",paddingLeft:isMobile?16:24,paddingRight:isMobile?16:24}}>
             <button onClick={()=>setScreen("menu")} style={{...styles.btn,fontSize:12,padding:"6px 16px"}}>← Back</button>
             <div style={{flex:1}}>
               <div style={{fontSize:isMobile?16:22,fontWeight:900,color:"#f8fafc",letterSpacing:"0.12em"}}>ARMORY</div>
-              <div style={{fontSize:10,color:"#334155",letterSpacing:"0.15em"}}>SKINS & BATTLE ARENAS</div>
+              <div style={{fontSize:10,color:"#334155",letterSpacing:"0.15em"}}>TANK SKINS</div>
             </div>
             <div style={{background:"rgba(250,204,21,0.08)",border:"1px solid rgba(250,204,21,0.2)",borderRadius:10,padding:"8px 14px",fontSize:14,color:"#facc15",fontWeight:900}}>◆ {coins.toLocaleString()}</div>
           </div>
 
-          <div style={{display:"flex",gap:4,margin:"0 0 12px",padding:"4px",background:"#0a0a1a",borderRadius:10}}>
-            {["skins","maps"].map(t=>(
-              <button key={t} onClick={()=>setShopTab(t)}
-                style={{padding:isMobile?"8px 20px":"8px 28px",background:shopTab===t?"rgba(255,255,255,0.07)":"transparent",border:shopTab===t?"1px solid #1e293b":"1px solid transparent",borderRadius:8,color:shopTab===t?"#e2e8f0":"#334155",fontSize:12,cursor:"pointer",fontFamily:"'Courier New'",letterSpacing:"0.1em",transition:"all 0.15s",touchAction:"manipulation"}}>
-                {t.toUpperCase()}
-              </button>
-            ))}
-          </div>
-
-          <div style={{overflowY:"auto",padding:isMobile?"12px 16px 80px":"18px 24px 24px",width:"100%",boxSizing:"border-box"}}>
-            {shopTab==="skins"&&(
-              <div style={{display:"grid",gridTemplateColumns:isMobile?"repeat(auto-fill,minmax(130px,1fr))":"repeat(auto-fill,minmax(155px,1fr))",gap:isMobile?8:12}}>
-                {SKINS.map(skin=>{
-                  const owned=ownedSkins.includes(skin.id);
-                  const equipped=equippedSkin===skin.id;
-                  const canBuy=coins>=skin.price&&!owned;
-                  return (
-                    <div key={skin.id} style={{background:equipped?"rgba(34,197,94,0.07)":"rgba(255,255,255,0.02)",border:`1.5px solid ${equipped?"#22c55e":owned?"#1e293b":"#0f172a"}`,borderRadius:12,padding:isMobile?"12px 8px":"16px 12px",display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?6:10}}>
-                      <MiniTank skin={skin.id} size={isMobile?52:70}/>
-                      <div style={{fontSize:10,fontWeight:700,color:equipped?"#22c55e":"#94a3b8",textAlign:"center"}}>{skin.name}</div>
-                      {equipped?(
-                        <div style={{fontSize:9,color:"#22c55e",border:"1px solid #22c55e44",borderRadius:99,padding:"2px 10px",letterSpacing:"0.1em"}}>EQUIPPED</div>
-                      ):owned?(
-                        <button onClick={()=>setEquippedSkin(skin.id)} style={{fontSize:10,color:"#94a3b8",background:"rgba(255,255,255,0.05)",border:"1px solid #1e293b",borderRadius:8,padding:"4px 10px",cursor:"pointer",fontFamily:"'Courier New'",touchAction:"manipulation"}}>Equip</button>
-                      ):(
-                        <button onClick={()=>buyItem("skin",skin.id,skin.price)} disabled={!canBuy}
-                          style={{fontSize:10,color:canBuy?"#facc15":"#334155",background:canBuy?"rgba(250,204,21,0.08)":"transparent",border:`1px solid ${canBuy?"rgba(250,204,21,0.3)":"#0f172a"}`,borderRadius:8,padding:"4px 10px",cursor:canBuy?"pointer":"default",fontFamily:"'Courier New'",touchAction:"manipulation"}}>
-                          ◆ {skin.price}
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {shopTab==="maps"&&(
-              <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"repeat(auto-fill,minmax(220px,1fr))",gap:14}}>
-                {MAPS.map(map=>{
-                  const owned=ownedMaps.includes(map.id);
-                  const equipped=equippedMap===map.id;
-                  const canBuy=coins>=map.price&&!owned;
-                  return (
-                    <div key={map.id} style={{background:equipped?"rgba(34,197,94,0.06)":"rgba(255,255,255,0.02)",border:`1.5px solid ${equipped?"#22c55e":owned?"#1e293b":"#0f172a"}`,borderRadius:14,padding:"18px 16px",display:"flex",flexDirection:"column",gap:10}}>
-                      <svg width="100%" height={isMobile?60:80} style={{background:map.bg,borderRadius:8,border:`1px solid ${map.border}`}} viewBox="0 0 200 120">
-                        {(map.walls||[]).map((w,i)=><rect key={i} x={w.x*200} y={w.y*120} width={w.w*200} height={w.h*120} fill={map.border} rx="3" opacity="0.9"/>)}
-                        <line x1="0" y1="0" x2="200" y2="0" stroke={map.border} strokeWidth="6"/>
-                        <line x1="0" y1="120" x2="200" y2="120" stroke={map.border} strokeWidth="6"/>
-                        <line x1="0" y1="0" x2="0" y2="120" stroke={map.border} strokeWidth="6"/>
-                        <line x1="200" y1="0" x2="200" y2="120" stroke={map.border} strokeWidth="6"/>
-                      </svg>
-                      <div style={{fontSize:13,fontWeight:700,color:equipped?"#22c55e":"#e2e8f0"}}>{map.name}</div>
-                      <div style={{fontSize:11,color:"#475569",lineHeight:1.6}}>{map.desc}</div>
-                      {equipped?(
-                        <div style={{fontSize:9,color:"#22c55e",border:"1px solid #22c55e44",borderRadius:99,padding:"3px 12px",letterSpacing:"0.1em",textAlign:"center"}}>SELECTED FOR PvP</div>
-                      ):owned?(
-                        <button onClick={()=>setEquippedMap(map.id)} style={{fontSize:11,color:"#94a3b8",background:"rgba(255,255,255,0.04)",border:"1px solid #1e293b",borderRadius:8,padding:"6px 14px",cursor:"pointer",fontFamily:"'Courier New'",touchAction:"manipulation"}}>Select for PvP</button>
-                      ):(
-                        <button onClick={()=>buyItem("map",map.id,map.price)} disabled={!canBuy}
-                          style={{fontSize:11,color:canBuy?"#facc15":"#334155",background:canBuy?"rgba(250,204,21,0.07)":"transparent",border:`1px solid ${canBuy?"rgba(250,204,21,0.25)":"#0f172a"}`,borderRadius:8,padding:"6px 14px",cursor:canBuy?"pointer":"default",fontFamily:"'Courier New'",touchAction:"manipulation"}}>
-                          ◆ {map.price} — Unlock
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+          <div style={{overflowY:"auto",padding:isMobile?"12px 16px 80px":"18px 24px 24px",width:"100%"}}>
+            <div style={{display:"grid",gridTemplateColumns:isMobile?"repeat(auto-fill,minmax(130px,1fr))":"repeat(auto-fill,minmax(155px,1fr))",gap:isMobile?8:12}}>
+              {SKINS.map(skin=>{
+                const owned=ownedSkins.includes(skin.id);
+                const equipped=equippedSkin===skin.id;
+                const canBuy=coins>=skin.price&&!owned;
+                return (
+                  <div key={skin.id} style={{background:equipped?"rgba(34,197,94,0.07)":"rgba(255,255,255,0.02)",border:`1.5px solid ${equipped?"#22c55e":owned?"#1e293b":"#0f172a"}`,borderRadius:12,padding:isMobile?"12px 8px":"16px 12px",display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?6:10}}>
+                    <MiniTank skin={skin.id} size={isMobile?52:70}/>
+                    <div style={{fontSize:10,fontWeight:700,color:equipped?"#22c55e":"#94a3b8",textAlign:"center"}}>{skin.name}</div>
+                    {equipped?(
+                      <div style={{fontSize:9,color:"#22c55e",border:"1px solid #22c55e44",borderRadius:99,padding:"2px 10px",letterSpacing:"0.1em"}}>EQUIPPED</div>
+                    ):owned?(
+                      <button onClick={()=>setEquippedSkin(skin.id)} style={{fontSize:10,color:"#94a3b8",background:"rgba(255,255,255,0.05)",border:"1px solid #1e293b",borderRadius:8,padding:"4px 10px",cursor:"pointer",fontFamily:"'Courier New'",touchAction:"manipulation"}}>Equip</button>
+                    ):(
+                      <button onClick={()=>buyItem("skin",skin.id,skin.price)} disabled={!canBuy}
+                        style={{fontSize:10,color:canBuy?"#facc15":"#334155",background:canBuy?"rgba(250,204,21,0.08)":"transparent",border:`1px solid ${canBuy?"rgba(250,204,21,0.3)":"#0f172a"}`,borderRadius:8,padding:"4px 10px",cursor:canBuy?"pointer":"default",fontFamily:"'Courier New'",touchAction:"manipulation"}}>
+                        ◆ {skin.price}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </div>
       )}
 
-      {/* ── Portrait-mode nudge (mobile only, portrait only, during game/powerup) ── */}
+      {/* Portrait-mode nudge */}
       {isMobile && !isLandscape && (screen==="game"||screen==="powerup") && (
-        <div style={{
-          position:"fixed",inset:0,zIndex:999,
-          background:"rgba(5,5,14,0.96)",
-          display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
-          gap:20,padding:24,
-        }}>
-          {/* Animated rotate icon */}
+        <div style={{position:"fixed",inset:0,zIndex:999,background:"rgba(5,5,14,0.96)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:20,padding:24}}>
           <div style={{fontSize:64,animation:"rotateHint 1.8s ease-in-out infinite"}}>📱</div>
           <div style={{textAlign:"center"}}>
             <div style={{fontSize:18,fontWeight:900,color:"#facc15",letterSpacing:"0.15em",marginBottom:8}}>ROTATE DEVICE</div>
-            <div style={{fontSize:12,color:"#475569",lineHeight:1.8}}>
-              Tank Wars plays best in <span style={{color:"#22c55e"}}>landscape mode</span>.<br/>
-              Rotate your phone to continue.
-            </div>
+            <div style={{fontSize:12,color:"#475569",lineHeight:1.8}}>Tank Wars plays best in <span style={{color:"#22c55e"}}>landscape mode</span>.<br/>Rotate your phone to continue.</div>
           </div>
-          {/* Wave / score summary so player isn't lost */}
           {hudData.mode==="survival"&&(
             <div style={{display:"flex",gap:24,borderTop:"1px solid #0f172a",paddingTop:16}}>
-              <div style={{textAlign:"center"}}>
-                <div style={{fontSize:10,color:"#334155",letterSpacing:"0.1em"}}>WAVE</div>
-                <div style={{fontSize:22,fontWeight:900,color:"#38bdf8"}}>{hudData.wave}</div>
-              </div>
-              <div style={{textAlign:"center"}}>
-                <div style={{fontSize:10,color:"#334155",letterSpacing:"0.1em"}}>SCORE</div>
-                <div style={{fontSize:22,fontWeight:900,color:"#fff"}}>{hudData.score.toLocaleString()}</div>
-              </div>
+              <div style={{textAlign:"center"}}><div style={{fontSize:10,color:"#334155",letterSpacing:"0.1em"}}>WAVE</div><div style={{fontSize:22,fontWeight:900,color:"#38bdf8"}}>{hudData.wave}</div></div>
+              <div style={{textAlign:"center"}}><div style={{fontSize:10,color:"#334155",letterSpacing:"0.1em"}}>SCORE</div><div style={{fontSize:22,fontWeight:900,color:"#fff"}}>{hudData.score.toLocaleString()}</div></div>
             </div>
           )}
-          <button onClick={()=>{cancelAnimationFrame(rafRef.current);setScreen("menu");}}
+          <button onClick={()=>{cancelAnimationFrame(rafRef.current);if(modeRef.current==="online")cleanupOnlineRoom();setScreen("menu");}}
             style={{marginTop:8,fontSize:11,color:"#334155",background:"transparent",border:"1px solid #0f172a",borderRadius:8,padding:"8px 20px",cursor:"pointer",fontFamily:"'Courier New'",touchAction:"manipulation"}}>
             ✕ Quit to Menu
           </button>
@@ -1553,24 +1585,10 @@ export default function TankWars() {
         </div>
       )}
 
+      {/* ── GAME CANVAS ───────────────────────────────────────────────────── */}
       {screen==="game"&&(
-        <div className="fade-in" style={{
-          display:"flex",
-          // In mobile landscape: stack canvas + thin HUD bar vertically (HUD on top, tight)
-          // In portrait / desktop: column as before
-          flexDirection:"column",
-          alignItems:"center",
-          gap: isMobile && isLandscape ? 2 : isMobile ? 4 : 8,
-          width:"100%",
-        }}>
-          {/* HUD — compact single row in mobile landscape */}
-          <div style={{
-            display:"flex",alignItems:"center",
-            gap: isMobile ? 8 : 16,
-            width: W,
-            padding:"0 4px",
-            boxSizing:"border-box",
-          }}>
+        <div className="fade-in" style={{display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile&&isLandscape?2:isMobile?4:8,width:"100%"}}>
+          <div style={{display:"flex",alignItems:"center",gap:isMobile?8:16,width:W,padding:"0 4px",boxSizing:"border-box"}}>
             <div style={{display:"flex",alignItems:"center",gap:5}}>
               <span style={{color:SKINS.find(s=>s.id===equippedSkin)?.body,fontSize:isMobile&&isLandscape?9:10,fontWeight:700}}>P1</span>
               <div style={{width:isMobile?(isLandscape?60:70):90,height:5,background:"#0a0a1a",borderRadius:3,overflow:"hidden"}}>
@@ -1578,7 +1596,7 @@ export default function TankWars() {
               </div>
               <span style={{color:"#e2e8f0",fontSize:isMobile&&isLandscape?9:10}}>{hudData.hp1}</span>
             </div>
-            {hudData.mode==="2p"&&(
+            {(hudData.mode==="2p"||hudData.mode==="online")&&(
               <div style={{display:"flex",alignItems:"center",gap:5}}>
                 <span style={{color:"#e879f9",fontSize:isMobile&&isLandscape?9:10,fontWeight:700}}>P2</span>
                 <div style={{width:isMobile?(isLandscape?60:70):90,height:5,background:"#0a0a1a",borderRadius:3,overflow:"hidden"}}>
@@ -1595,40 +1613,34 @@ export default function TankWars() {
                 <span style={{color:"#facc15",fontSize:isMobile&&isLandscape?9:10}}>◆{coins}</span>
               </div>
             )}
-            {hudData.mode==="2p"&&isMobile&&(
+            {(hudData.mode==="2p"||hudData.mode==="online")&&isMobile&&(
               <div style={{display:"flex",gap:6,alignItems:"center",fontSize:isMobile&&isLandscape?9:11}}>
                 <span style={{color:"#22c55e",fontWeight:700}}>P1 {p1WinsRef.current}</span>
                 <span style={{color:"#1e293b"}}>–</span>
                 <span style={{color:"#e879f9",fontWeight:700}}>{p2WinsRef.current} P2</span>
               </div>
             )}
-            <button onClick={()=>{cancelAnimationFrame(rafRef.current);setScreen("menu");}}
+            <button onClick={()=>{cancelAnimationFrame(rafRef.current);if(modeRef.current==="online")cleanupOnlineRoom();setScreen("menu");}}
               style={{fontSize:10,color:"#334155",background:"transparent",border:"1px solid #0f172a",borderRadius:6,padding:"3px 8px",cursor:"pointer",fontFamily:"'Courier New'",touchAction:"manipulation",lineHeight:1}}>✕</button>
           </div>
 
-          <canvas
-            ref={canvasRef}
-            width={W}
-            height={H}
-            style={{border:"1px solid #0a0a1a",borderRadius:6,display:"block",touchAction:"none"}}
-          />
+          <canvas ref={canvasRef} width={W} height={H} style={{border:"1px solid #0a0a1a",borderRadius:6,display:"block",touchAction:"none"}}/>
 
-          {/* Hint strip — only show in desktop or portrait mobile (landscape has no space) */}
           {(!isMobile || !isLandscape) && (
             isMobile ? (
-              <div style={{fontSize:9,color:"#1e293b",letterSpacing:"0.05em",textAlign:"center"}}>
-                Left side: move · Right side: aim &amp; fire
-              </div>
+              <div style={{fontSize:9,color:"#1e293b",letterSpacing:"0.05em",textAlign:"center"}}>Left side: move · Right side: aim &amp; fire</div>
             ) : (
               <div style={{fontSize:10,color:"#1e293b",letterSpacing:"0.06em"}}>
                 {hudData.mode==="survival"&&"WASD move · Space fire · Shift dash · Kill to heal"}
                 {hudData.mode==="2p"&&"P1: WASD+Space+Shift · P2: Arrows+Enter+RShift"}
+                {hudData.mode==="online"&&(onlineRoleRef.current==="host"?"You are P1: WASD + Space to shoot":"You are P2: Arrows + Enter to shoot")}
               </div>
             )
           )}
         </div>
       )}
 
+      {/* ── POWERUP PICK ──────────────────────────────────────────────────── */}
       {screen==="powerup"&&(
         <div className="fade-in" style={{display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?14:24,maxWidth:900,padding:"0 16px",width:"100%",overflowY:"auto",maxHeight:"100vh"}}>
           <div style={{textAlign:"center",paddingTop:isMobile?12:0}}>
@@ -1636,7 +1648,6 @@ export default function TankWars() {
             <h2 style={{fontSize:isMobile?24:34,fontWeight:900,letterSpacing:"0.18em",color:"#f8fafc",margin:"0 0 4px"}}>UPGRADE</h2>
             <p style={{color:"#475569",fontSize:11,margin:0}}>Choose one — wave {waveRef.current+1} awaits</p>
           </div>
-
           <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(4,1fr)",gap:isMobile?8:12,width:"100%"}}>
             {offeredPowerups.map(pu=>{
               const count=p1?.upgrades?.[pu.id]||0;
@@ -1646,7 +1657,7 @@ export default function TankWars() {
                 <button key={pu.id} onClick={()=>handlePowerupPick(pu.id)}
                   onMouseEnter={()=>!isMobile&&setHoveredPu(pu.id)} onMouseLeave={()=>!isMobile&&setHoveredPu(null)}
                   style={{padding:isMobile?"14px 10px":"22px 16px 18px",background:hov?"rgba(255,255,255,0.06)":"rgba(255,255,255,0.025)",border:`1.5px solid ${hov?pu.color:"#0f172a"}`,borderRadius:16,cursor:"pointer",transition:"all 0.18s ease",transform:hov?"translateY(-10px) scale(1.04)":"none",display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?6:10,position:"relative",overflow:"hidden",outline:"none",touchAction:"manipulation",WebkitTapHighlightColor:"transparent"}}>
-                  <div style={{fontSize:isMobile?9:9,letterSpacing:"0.15em",color:hov?cc:"#334155",fontWeight:700}}>{pu.cat}</div>
+                  <div style={{fontSize:9,letterSpacing:"0.15em",color:hov?cc:"#334155",fontWeight:700}}>{pu.cat}</div>
                   <div style={{fontSize:isMobile?28:38,lineHeight:1}}>{pu.icon}</div>
                   <div style={{fontWeight:800,fontSize:isMobile?10:12,color:hov?pu.color:"#e2e8f0",letterSpacing:"0.04em",textAlign:"center"}}>{pu.name}</div>
                   {!isMobile&&<div style={{fontSize:10,color:"#475569",textAlign:"center",lineHeight:1.7}}>{pu.desc}</div>}
@@ -1655,7 +1666,6 @@ export default function TankWars() {
               );
             })}
           </div>
-
           {p1&&!isMobile&&(
             <div style={{display:"flex",gap:12,alignItems:"center",fontSize:11,color:"#334155",border:"1px solid #0a0a1a",borderRadius:10,padding:"10px 20px",background:"#030308",flexWrap:"wrap",justifyContent:"center",marginBottom:16}}>
               <span style={{color:"#1e293b",letterSpacing:"0.1em"}}>STATS</span>
@@ -1668,6 +1678,7 @@ export default function TankWars() {
         </div>
       )}
 
+      {/* ── GAME OVER ─────────────────────────────────────────────────────── */}
       {screen==="over"&&(
         <div className="fade-in" style={{display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?16:24,padding:"0 16px",textAlign:"center"}}>
           <div>
@@ -1692,7 +1703,7 @@ export default function TankWars() {
           <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(4,auto)",gap:10,marginTop:8}}>
             {[
               {label:"▶  Play Again",accent:"#22c55e",onClick:()=>modeRef.current==="survival"?startSurvival():start2P()},
-              {label:"🏆  Scores",accent:"#38bdf8",onClick:()=>setScreen("leaderboard")},
+              {label:"🏆  Scores",accent:"#38bdf8",onClick:()=>{loadLeaderboard();setScreen("leaderboard");}},
               {label:"🛒  Shop",accent:"#f59e0b",onClick:()=>setScreen("shop")},
               {label:"⌂  Menu",accent:"#38bdf8",onClick:()=>setScreen("menu")},
             ].map(btn=>(
