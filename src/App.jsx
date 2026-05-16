@@ -31,6 +31,76 @@ async function sbFetch(path, opts = {}) {
   }
 }
 
+// ─── Simple local password/profile helpers (stores profiles in localStorage)
+async function hashPassword(pw) {
+  try {
+    const enc = new TextEncoder().encode(pw);
+    const buf = await crypto.subtle.digest('SHA-256', enc);
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  } catch (e) {
+    return null;
+  }
+}
+
+async function setPasswordForUser(username, password) {
+  if (!username || !password) return false;
+  const h = await hashPassword(password);
+  if (!h) return false;
+  try { localStorage.setItem(`tank_profile_pw_${username}`, h); return true; } catch { return false; }
+}
+
+async function verifyPasswordForUser(username, password) {
+  try {
+    const stored = localStorage.getItem(`tank_profile_pw_${username}`);
+    if (!stored) return false;
+    const h = await hashPassword(password);
+    return h === stored;
+  } catch { return false; }
+}
+
+function saveProfileForUser(username, profileObj) {
+  if (!username) return false;
+  try { localStorage.setItem(`tank_profile_${username}`, JSON.stringify(profileObj)); return true; } catch { return false; }
+}
+
+function loadProfileForUser(username) {
+  if (!username) return null;
+  try { const s = localStorage.getItem(`tank_profile_${username}`); return s ? JSON.parse(s) : null; } catch { return null; }
+}
+
+// ─── Supabase profile register / login helpers
+async function registerWithSupabase(username, password, localProfile) {
+  if (SUPABASE_DISABLED) return { ok: false, msg: 'Supabase not configured' };
+  if (!username || !password) return { ok: false, msg: 'Missing username or password' };
+  // check existing
+  const existing = await sbFetch(`/profiles?username=eq.${encodeURIComponent(username)}&select=id`);
+  if (existing && existing.length > 0) return { ok: false, msg: 'Username already taken' };
+  const pwHash = await hashPassword(password);
+  const body = {
+    username,
+    password_hash: pwHash,
+    coins: localProfile?.coins || 0,
+    owned_skins: localProfile?.ownedSkins || ["default"],
+    equipped_skin: localProfile?.equippedSkin || "default",
+    created_at: new Date().toISOString(),
+  };
+  const res = await sbFetch('/profiles', { method: 'POST', prefer: 'return=representation', body: JSON.stringify(body) });
+  if (!res) return { ok: false, msg: 'Failed to register (network or server error)' };
+  return { ok: true, data: res };
+}
+
+async function loginWithSupabase(username, password) {
+  if (SUPABASE_DISABLED) return { ok: false, msg: 'Supabase not configured' };
+  if (!username || !password) return { ok: false, msg: 'Missing username or password' };
+  const rows = await sbFetch(`/profiles?username=eq.${encodeURIComponent(username)}&select=*&limit=1`);
+  if (!rows || rows.length === 0) return { ok: false, msg: 'User not found' };
+  const row = rows[0];
+  const h = await hashPassword(password);
+  if (h !== row.password_hash) return { ok: false, msg: 'Invalid credentials' };
+  // success
+  return { ok: true, data: row };
+}
+
 // Supabase leaderboard helpers
 async function fetchLeaderboard() {
   const data = await sbFetch("/leaderboard?order=score.desc&limit=10&select=*");
@@ -95,7 +165,14 @@ function createRealtimeChannel(channelName, onMessage) {
       console.warn("Supabase realtime socket error:", error);
     };
     ws.onclose = () => {
+  return () => { window.removeEventListener("resize", resize); cancelAnimationFrame(rafRef.current); }
       clearInterval(heartbeat);
+
+  useEffect(() => {
+  const name = (usernameInput || "").trim();
+  setIsExistingProfile(!!(name && localStorage.getItem(`tank_profile_${name}`)));
+  if (!name) setProfileMessage("");
+  }, [usernameInput]);
       if (!closed) setTimeout(connect, 2000);
     };
   }
@@ -301,6 +378,9 @@ export default function TankWars() {
   const [screen,           setScreen]           = useState("username");
   const [username,         setUsername]         = useState("");
   const [usernameInput,    setUsernameInput]     = useState("");
+  const [passwordInput,    setPasswordInput]     = useState("");
+  const [profileMessage,   setProfileMessage]    = useState("");
+  const [isExistingProfile,setIsExistingProfile]= useState(false);
   const [coins,            setCoins]            = useState(0);
   const [ownedSkins,       setOwnedSkins]       = useState(["default"]);
   const [equippedSkin,     setEquippedSkin]     = useState("default");
@@ -1322,6 +1402,137 @@ export default function TankWars() {
             >
               ▶ ENTER BATTLE
             </button>
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              <input
+                style={styles.input}
+                placeholder={isExistingProfile?"Enter password to restore":"Set a password (optional)"}
+                type="password"
+                value={passwordInput}
+                onChange={e=>setPasswordInput(e.target.value)}
+              />
+              <div style={{display:"flex",gap:8}}>
+                <div style={{display:"flex",flexDirection:"column",gap:8,flex:1}}>
+                  {isExistingProfile ? (
+                    <button
+                      onClick={async ()=>{
+                        const name = (usernameInput||"").trim();
+                        if(!name) return;
+                        setProfileMessage("Checking local password...");
+                        const ok = await verifyPasswordForUser(name,passwordInput);
+                        if(ok) {
+                          const prof = loadProfileForUser(name);
+                          if(prof) {
+                            setCoins(prof.coins||0);
+                            setOwnedSkins(prof.ownedSkins||["default"]);
+                            setEquippedSkin(prof.equippedSkin||"default");
+                            setProfileMessage("Profile restored (local)");
+                            setUsername(name);
+                            setScreen("menu");
+                            return;
+                          }
+                        }
+                        // fallback to Supabase if configured
+                        if (!passwordInput) { setProfileMessage("Enter password to restore"); return; }
+                        if (!SUPABASE_DISABLED) {
+                          setProfileMessage("Checking Supabase credentials...");
+                          const res = await loginWithSupabase(name,passwordInput);
+                          if(!res.ok) { setProfileMessage(res.msg); return; }
+                          const row = Array.isArray(res.data)?res.data[0]:res.data;
+                          setCoins(row.coins||0);
+                          setOwnedSkins(row.owned_skins||["default"]);
+                          setEquippedSkin(row.equipped_skin||"default");
+                          saveProfileForUser(name,{ coins:row.coins||0, ownedSkins:row.owned_skins||["default"], equippedSkin:row.equipped_skin||"default" });
+                          setProfileMessage("Profile restored (Supabase)");
+                          setUsername(name);
+                          setScreen("menu");
+                          return;
+                        }
+                        setProfileMessage("Invalid password or no profile found");
+                      }}
+                      style={{...styles.btn,background:"rgba(34,197,94,0.06)",borderColor:"#0f172a",color:"#22c55e"}}
+                    >
+                      Restore Profile
+                    </button>
+                  ) : (
+                    <button
+                      onClick={async ()=>{
+                        const name = (usernameInput||"").trim();
+                        if(!name) return;
+                        if(!passwordInput) { setProfileMessage("Enter a password to save your profile"); return; }
+                        const ok = await setPasswordForUser(name,passwordInput);
+                        // save current minimal profile
+                        saveProfileForUser(name,{ coins, ownedSkins, equippedSkin });
+                        if(ok) {
+                          setProfileMessage("Password set and profile saved (local)");
+                          setUsername(name);
+                          setScreen("menu");
+                        } else {
+                          setProfileMessage("Failed to save profile");
+                        }
+                      }}
+                      style={{...styles.btn,background:"rgba(34,197,94,0.06)",borderColor:"#0f172a",color:"#22c55e"}}
+                    >
+                      Set Password & Save (Local)
+                    </button>
+                  )}
+
+                  {!SUPABASE_DISABLED && (
+                    <div style={{display:"flex",gap:8}}>
+                      <button
+                        onClick={async ()=>{
+                          const name = (usernameInput||"").trim();
+                          if(!name || !passwordInput) { setProfileMessage("Enter username and password"); return; }
+                          setProfileMessage("Registering on Supabase...");
+                          const res = await registerWithSupabase(name,passwordInput,{ coins, ownedSkins, equippedSkin });
+                          if(!res.ok) { setProfileMessage(res.msg); return; }
+                          const row = Array.isArray(res.data)?res.data[0]:res.data;
+                          setCoins(row.coins||0);
+                          setOwnedSkins(row.owned_skins||["default"]);
+                          setEquippedSkin(row.equipped_skin||"default");
+                          saveProfileForUser(name,{ coins:row.coins||0, ownedSkins:row.owned_skins||["default"], equippedSkin:row.equipped_skin||"default" });
+                          setProfileMessage("Registered and saved (Supabase)");
+                          setUsername(name);
+                          setScreen("menu");
+                        }}
+                        style={{...styles.btn,flex:1,background:"rgba(59,130,246,0.08)",borderColor:"#0b1220",color:"#60a5fa"}}
+                      >
+                        Register (Supabase)
+                      </button>
+                      <button
+                        onClick={async ()=>{
+                          const name = (usernameInput||"").trim();
+                          if(!name || !passwordInput) { setProfileMessage("Enter username and password"); return; }
+                          setProfileMessage("Logging in via Supabase...");
+                          const res = await loginWithSupabase(name,passwordInput);
+                          if(!res.ok) { setProfileMessage(res.msg); return; }
+                          const row = Array.isArray(res.data)?res.data[0]:res.data;
+                          setCoins(row.coins||0);
+                          setOwnedSkins(row.owned_skins||["default"]);
+                          setEquippedSkin(row.equipped_skin||"default");
+                          saveProfileForUser(name,{ coins:row.coins||0, ownedSkins:row.owned_skins||["default"], equippedSkin:row.equipped_skin||"default" });
+                          setProfileMessage("Logged in (Supabase)");
+                          setUsername(name);
+                          setScreen("menu");
+                        }}
+                        style={{...styles.btn,flex:1,background:"rgba(16,185,129,0.06)",borderColor:"#042f23",color:"#34d399"}}
+                      >
+                        Login (Supabase)
+                      </button>
+                    </div>
+                  )}
+
+                  <div style={{display:"flex",marginTop:4}}>
+                    <button
+                      onClick={()=>{ if(usernameInput.trim()){ setUsername(usernameInput.trim()); setScreen("menu"); }}}
+                      style={{...styles.btn,flex:1,background:"transparent",borderColor:"#1e293b",color:"#334155"}}
+                    >
+                      Skip
+                    </button>
+                  </div>
+                </div>
+              </div>
+              {profileMessage&&<div style={{fontSize:12,color:"#86efac"}}>{profileMessage}</div>}
+            </div>
           </div>
           <div style={{fontSize:10,color:"#1e293b",letterSpacing:"0.06em",textAlign:"center"}}>No account required · Scores go to global leaderboard</div>
         </div>
