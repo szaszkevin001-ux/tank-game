@@ -2,22 +2,33 @@ import { useEffect, useRef, useState, useCallback } from "react";
 
 // ─── SUPABASE CONFIG ────────────────────────────────────────────────────────
 // Replace these with your actual Supabase project URL and anon key
-const SUPABASE_URL = "https://YOUR_PROJECT.supabase.co";
-const SUPABASE_ANON_KEY = "YOUR_ANON_KEY";
+const SUPABASE_URL = "https://gnzeqdxqfbbupfhfumgz.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImduemVxZHhxZmJidXBmaGZ1bWd6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg5MTM0MzAsImV4cCI6MjA5NDQ4OTQzMH0.MjXP8SY9Cr0IMzvjKtILJzb_roG9iVl8K3ShidSKwuo";
+const SUPABASE_DISABLED = !SUPABASE_URL || SUPABASE_URL.includes("your_project.supabase.co") || SUPABASE_ANON_KEY.includes("YOUR_ANON_KEY") || SUPABASE_ANON_KEY.length < 20;
 
 async function sbFetch(path, opts = {}) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1${path}`, {
-    ...opts,
-    headers: {
-      "Content-Type": "application/json",
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-      Prefer: opts.prefer || "",
-      ...(opts.headers || {}),
-    },
-  });
-  if (!res.ok) return null;
-  try { return await res.json(); } catch { return null; }
+  if (SUPABASE_DISABLED) {
+    console.warn("Supabase fetch skipped: invalid project URL or anon key.");
+    return null;
+  }
+
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1${path}`, {
+      ...opts,
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        Prefer: opts.prefer || "",
+        ...(opts.headers || {}),
+      },
+    });
+    if (!res.ok) return null;
+    try { return await res.json(); } catch { return null; }
+  } catch (error) {
+    console.warn("Supabase fetch failed:", error);
+    return null;
+  }
 }
 
 // Supabase leaderboard helpers
@@ -49,6 +60,14 @@ async function submitScore(username, score, wave, skin) {
 // ─── SUPABASE REALTIME (for online PvP) ──────────────────────────────────────
 // Uses Supabase Realtime broadcast channel — no DB table needed
 function createRealtimeChannel(channelName, onMessage) {
+  if (SUPABASE_DISABLED) {
+    console.warn("Supabase realtime disabled: invalid project URL or anon key.");
+    return {
+      send: () => {},
+      close: () => {},
+    };
+  }
+
   const wsUrl = `${SUPABASE_URL.replace("https://", "wss://")}/realtime/v1/websocket?apikey=${SUPABASE_ANON_KEY}&vsn=1.0.0`;
   let ws = null;
   let heartbeat = null;
@@ -68,7 +87,12 @@ function createRealtimeChannel(channelName, onMessage) {
         if (msg.event === "broadcast" && msg.payload?.event) {
           onMessage(msg.payload.event, msg.payload.payload);
         }
-      } catch {}
+      } catch (error) {
+        console.warn("Supabase realtime message parse failed:", error);
+      }
+    };
+    ws.onerror = (error) => {
+      console.warn("Supabase realtime socket error:", error);
     };
     ws.onclose = () => {
       clearInterval(heartbeat);
@@ -478,6 +502,12 @@ export default function TankWars() {
 
   // ── Online PvP: Create Room ──────────────────────────────────────────────
   function createOnlineRoom() {
+    if (SUPABASE_DISABLED) {
+      setOnlineStatus("Online PvP is unavailable. Configure your Supabase URL and anon key.");
+      setOnlineWaiting(false);
+      return;
+    }
+
     const code = genRoomCode();
     setCurrentRoomCode(code);
     setOnlineStatus("Waiting for opponent to join...");
@@ -505,6 +535,12 @@ export default function TankWars() {
 
   function joinOnlineRoom(code) {
     if (!code.trim()) return;
+    if (SUPABASE_DISABLED) {
+      setOnlineStatus("Online PvP is unavailable. Configure your Supabase URL and anon key.");
+      setOnlineWaiting(false);
+      return;
+    }
+
     const upper = code.trim().toUpperCase();
     setOnlineStatus("Connecting...");
     setOnlineWaiting(true);
