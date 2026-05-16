@@ -191,6 +191,7 @@ export default function TankWars() {
   const [leaderboard,      setLeaderboard]      = useState([]);
   const [pvpMapChoice,     setPvpMapChoice]     = useState("open");
   const [isMobile,         setIsMobile]         = useState(false);
+  const [isLandscape,      setIsLandscape]      = useState(true);
   const [, rerender]      = useState(0);
 
   useEffect(() => {
@@ -199,27 +200,59 @@ export default function TankWars() {
     setIsMobile(mobile);
     isMobileRef.current = mobile;
 
-    function resize() {
-      const vw=window.innerWidth, vh=window.innerHeight;
-      const ratio=800/560;
-      let W,H;
-      if(mobile) {
-        // On mobile: use full width, keep ratio, leave space for controls
-        W = vw - 8;
-        H = W / ratio;
-        // If height too tall, constrain
-        const maxH = vh * 0.52;
-        if(H > maxH) { H = maxH; W = H * ratio; }
-      } else {
-        if(vw/vh>ratio){H=vh-60;W=H*ratio;}else{W=vw-20;H=W/ratio;}
-      }
-      dimRef.current={W:Math.floor(W),H:Math.floor(H)};
-      rerender(n=>n+1);
+    function getOrientation() {
+      // Use screen.orientation API when available, fall back to window dimensions
+      if (screen.orientation) return screen.orientation.type.startsWith("landscape");
+      return window.innerWidth > window.innerHeight;
     }
+
+    function resize() {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const ratio = 800 / 560;
+      const landscape = getOrientation();
+      setIsLandscape(landscape);
+
+      let W, H;
+      if (mobile) {
+        if (landscape) {
+          // Landscape: maximize canvas height, keep ratio, leave ~40px for HUD strip
+          const hudH = 36;
+          H = vh - hudH - 8;
+          W = H * ratio;
+          // If wider than screen, clamp to width
+          if (W > vw - 8) { W = vw - 8; H = W / ratio; }
+        } else {
+          // Portrait: use full width, allow ~52% of height for canvas
+          W = vw - 8;
+          H = W / ratio;
+          const maxH = vh * 0.52;
+          if (H > maxH) { H = maxH; W = H * ratio; }
+        }
+      } else {
+        if (vw / vh > ratio) { H = vh - 60; W = H * ratio; } else { W = vw - 20; H = W / ratio; }
+      }
+      dimRef.current = { W: Math.floor(W), H: Math.floor(H) };
+      rerender(n => n + 1);
+    }
+
     resize();
-    window.addEventListener("resize",resize);
-    return ()=>window.removeEventListener("resize",resize);
-  },[]);
+
+    // Listen to both resize and orientationchange for instant response
+    window.addEventListener("resize", resize);
+    window.addEventListener("orientationchange", () => {
+      // Small delay lets the browser finish rotating before we read dimensions
+      setTimeout(resize, 120);
+    });
+    if (screen.orientation) {
+      screen.orientation.addEventListener("change", resize);
+    }
+
+    return () => {
+      window.removeEventListener("resize", resize);
+      window.removeEventListener("orientationchange", resize);
+      if (screen.orientation) screen.orientation.removeEventListener("change", resize);
+    };
+  }, []);
 
   // Keyboard controls (desktop)
   useEffect(()=>{
@@ -1482,36 +1515,95 @@ export default function TankWars() {
         </div>
       )}
 
+      {/* ── Portrait-mode nudge (mobile only, portrait only, during game/powerup) ── */}
+      {isMobile && !isLandscape && (screen==="game"||screen==="powerup") && (
+        <div style={{
+          position:"fixed",inset:0,zIndex:999,
+          background:"rgba(5,5,14,0.96)",
+          display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+          gap:20,padding:24,
+        }}>
+          {/* Animated rotate icon */}
+          <div style={{fontSize:64,animation:"rotateHint 1.8s ease-in-out infinite"}}>📱</div>
+          <div style={{textAlign:"center"}}>
+            <div style={{fontSize:18,fontWeight:900,color:"#facc15",letterSpacing:"0.15em",marginBottom:8}}>ROTATE DEVICE</div>
+            <div style={{fontSize:12,color:"#475569",lineHeight:1.8}}>
+              Tank Wars plays best in <span style={{color:"#22c55e"}}>landscape mode</span>.<br/>
+              Rotate your phone to continue.
+            </div>
+          </div>
+          {/* Wave / score summary so player isn't lost */}
+          {hudData.mode==="survival"&&(
+            <div style={{display:"flex",gap:24,borderTop:"1px solid #0f172a",paddingTop:16}}>
+              <div style={{textAlign:"center"}}>
+                <div style={{fontSize:10,color:"#334155",letterSpacing:"0.1em"}}>WAVE</div>
+                <div style={{fontSize:22,fontWeight:900,color:"#38bdf8"}}>{hudData.wave}</div>
+              </div>
+              <div style={{textAlign:"center"}}>
+                <div style={{fontSize:10,color:"#334155",letterSpacing:"0.1em"}}>SCORE</div>
+                <div style={{fontSize:22,fontWeight:900,color:"#fff"}}>{hudData.score.toLocaleString()}</div>
+              </div>
+            </div>
+          )}
+          <button onClick={()=>{cancelAnimationFrame(rafRef.current);setScreen("menu");}}
+            style={{marginTop:8,fontSize:11,color:"#334155",background:"transparent",border:"1px solid #0f172a",borderRadius:8,padding:"8px 20px",cursor:"pointer",fontFamily:"'Courier New'",touchAction:"manipulation"}}>
+            ✕ Quit to Menu
+          </button>
+          <style>{`@keyframes rotateHint{0%{transform:rotate(0deg)}40%{transform:rotate(90deg)}60%{transform:rotate(90deg)}100%{transform:rotate(0deg)}}`}</style>
+        </div>
+      )}
+
       {screen==="game"&&(
-        <div className="fade-in" style={{display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?4:8,width:"100%"}}>
-          {/* HUD */}
-          <div style={{display:"flex",alignItems:"center",gap:isMobile?8:16,width:W,padding:"0 4px",boxSizing:"border-box",flexWrap:isMobile?"wrap":"nowrap"}}>
-            <div style={{display:"flex",alignItems:"center",gap:6}}>
-              <span style={{color:SKINS.find(s=>s.id===equippedSkin)?.body,fontSize:10,fontWeight:700}}>P1</span>
-              <div style={{width:isMobile?70:90,height:6,background:"#0a0a1a",borderRadius:3,overflow:"hidden"}}>
+        <div className="fade-in" style={{
+          display:"flex",
+          // In mobile landscape: stack canvas + thin HUD bar vertically (HUD on top, tight)
+          // In portrait / desktop: column as before
+          flexDirection:"column",
+          alignItems:"center",
+          gap: isMobile && isLandscape ? 2 : isMobile ? 4 : 8,
+          width:"100%",
+        }}>
+          {/* HUD — compact single row in mobile landscape */}
+          <div style={{
+            display:"flex",alignItems:"center",
+            gap: isMobile ? 8 : 16,
+            width: W,
+            padding:"0 4px",
+            boxSizing:"border-box",
+          }}>
+            <div style={{display:"flex",alignItems:"center",gap:5}}>
+              <span style={{color:SKINS.find(s=>s.id===equippedSkin)?.body,fontSize:isMobile&&isLandscape?9:10,fontWeight:700}}>P1</span>
+              <div style={{width:isMobile?(isLandscape?60:70):90,height:5,background:"#0a0a1a",borderRadius:3,overflow:"hidden"}}>
                 <div style={{height:"100%",borderRadius:3,transition:"width 0.15s",width:`${Math.min(100,(hudData.hp1/hudData.maxHp1)*100)}%`,background:hudData.hp1/hudData.maxHp1>0.5?"#4ade80":hudData.hp1/hudData.maxHp1>0.25?"#facc15":"#f87171"}}/>
               </div>
-              <span style={{color:"#e2e8f0",fontSize:10}}>{hudData.hp1}</span>
+              <span style={{color:"#e2e8f0",fontSize:isMobile&&isLandscape?9:10}}>{hudData.hp1}</span>
             </div>
             {hudData.mode==="2p"&&(
-              <div style={{display:"flex",alignItems:"center",gap:6}}>
-                <span style={{color:"#e879f9",fontSize:10,fontWeight:700}}>P2</span>
-                <div style={{width:isMobile?70:90,height:6,background:"#0a0a1a",borderRadius:3,overflow:"hidden"}}>
+              <div style={{display:"flex",alignItems:"center",gap:5}}>
+                <span style={{color:"#e879f9",fontSize:isMobile&&isLandscape?9:10,fontWeight:700}}>P2</span>
+                <div style={{width:isMobile?(isLandscape?60:70):90,height:5,background:"#0a0a1a",borderRadius:3,overflow:"hidden"}}>
                   <div style={{height:"100%",borderRadius:3,transition:"width 0.15s",width:`${Math.max(0,(hudData.hp2/hudData.maxHp2)*100)}%`,background:"#e879f9"}}/>
                 </div>
-                <span style={{color:"#e2e8f0",fontSize:10}}>{hudData.hp2}</span>
+                <span style={{color:"#e2e8f0",fontSize:isMobile&&isLandscape?9:10}}>{hudData.hp2}</span>
               </div>
             )}
             <div style={{flex:1}}/>
             {hudData.mode==="survival"&&(
-              <div style={{display:"flex",gap:isMobile?8:18,alignItems:"center"}}>
-                <span style={{color:"#facc15",fontSize:isMobile?10:12,fontWeight:700}}>W{hudData.wave}</span>
-                <span style={{color:"#fff",fontSize:isMobile?10:11}}>{hudData.score.toLocaleString()}</span>
-                <span style={{color:"#facc15",fontSize:10}}>◆{coins}</span>
+              <div style={{display:"flex",gap:isMobile?6:18,alignItems:"center"}}>
+                <span style={{color:"#facc15",fontSize:isMobile&&isLandscape?9:isMobile?10:12,fontWeight:700}}>W{hudData.wave}</span>
+                <span style={{color:"#fff",fontSize:isMobile&&isLandscape?9:isMobile?10:11}}>{hudData.score.toLocaleString()}</span>
+                <span style={{color:"#facc15",fontSize:isMobile&&isLandscape?9:10}}>◆{coins}</span>
+              </div>
+            )}
+            {hudData.mode==="2p"&&isMobile&&(
+              <div style={{display:"flex",gap:6,alignItems:"center",fontSize:isMobile&&isLandscape?9:11}}>
+                <span style={{color:"#22c55e",fontWeight:700}}>P1 {p1WinsRef.current}</span>
+                <span style={{color:"#1e293b"}}>–</span>
+                <span style={{color:"#e879f9",fontWeight:700}}>{p2WinsRef.current} P2</span>
               </div>
             )}
             <button onClick={()=>{cancelAnimationFrame(rafRef.current);setScreen("menu");}}
-              style={{fontSize:10,color:"#334155",background:"transparent",border:"1px solid #0f172a",borderRadius:6,padding:"4px 10px",cursor:"pointer",fontFamily:"'Courier New'",touchAction:"manipulation"}}>✕</button>
+              style={{fontSize:10,color:"#334155",background:"transparent",border:"1px solid #0f172a",borderRadius:6,padding:"3px 8px",cursor:"pointer",fontFamily:"'Courier New'",touchAction:"manipulation",lineHeight:1}}>✕</button>
           </div>
 
           <canvas
@@ -1521,16 +1613,18 @@ export default function TankWars() {
             style={{border:"1px solid #0a0a1a",borderRadius:6,display:"block",touchAction:"none"}}
           />
 
-          {/* Mobile hint text */}
-          {isMobile ? (
-            <div style={{fontSize:9,color:"#1e293b",letterSpacing:"0.05em",textAlign:"center"}}>
-              Left side: move · Right side: aim &amp; fire
-            </div>
-          ) : (
-            <div style={{fontSize:10,color:"#1e293b",letterSpacing:"0.06em"}}>
-              {hudData.mode==="survival"&&"WASD move · Space fire · Shift dash · Kill to heal"}
-              {hudData.mode==="2p"&&"P1: WASD+Space+Shift · P2: Arrows+Enter+RShift"}
-            </div>
+          {/* Hint strip — only show in desktop or portrait mobile (landscape has no space) */}
+          {(!isMobile || !isLandscape) && (
+            isMobile ? (
+              <div style={{fontSize:9,color:"#1e293b",letterSpacing:"0.05em",textAlign:"center"}}>
+                Left side: move · Right side: aim &amp; fire
+              </div>
+            ) : (
+              <div style={{fontSize:10,color:"#1e293b",letterSpacing:"0.06em"}}>
+                {hudData.mode==="survival"&&"WASD move · Space fire · Shift dash · Kill to heal"}
+                {hudData.mode==="2p"&&"P1: WASD+Space+Shift · P2: Arrows+Enter+RShift"}
+              </div>
+            )
           )}
         </div>
       )}
