@@ -289,6 +289,41 @@ const POWERUPS = [
   { id:"warpshot",  icon:"◎",  name:"Warp Shot",         desc:"Teleport bullet on wall hit.",         color:"#d946ef", cat:"UTILITY",   apply:(p)=>{ p.warpBullets=true; } },
 ];
 
+// Boss-only powerups (stronger / unique effects)
+const BOSS_POWERUPS = [
+  { id: "boss_shield", icon: "🔷", name: "Titan Barrier", desc: "Block two bullets for 15s.", color: "#60a5fa", apply: (p) => { p.hasBarrier = true; p.barrierStacks = 2; p.barrierCd = 0; } },
+  { id: "boss_overdrive", icon: "⚡", name: "Overdrive", desc: "+30% fire rate permanently for the run.", color: "#f97316", apply: (p) => { p.shootCd = Math.max(40, (p.shootCd || BASE_SHOOT_CD) * 0.7); } },
+  { id: "boss_rail", icon: "🔭", name: "Rail Condenser", desc: "Build a charged rail shot every 20s.", color: "#fbbf24", apply: (p) => { p.hasRail = true; p.railCd = 0; } },
+  { id: "boss_drone", icon: "🤖", name: "Drone Companion", desc: "Spawn a small attack drone on spawn.", color: "#34d399", apply: (p) => { p.hasDrone = true; } },
+];
+
+const BOSS_TYPES = ["siege","splitter","stealth","railgun","summoner"];
+
+// Skill tree perks
+const PERKS = [
+  { id: "reload_speed", name: "Reload Boost", desc: "+5% fire rate", cost: 1, apply: (p) => { p.permanentUpgrades.reloadSpeed = (p.permanentUpgrades.reloadSpeed||0) + 0.05; } },
+  { id: "start_shield", name: "Starting Shield", desc: "Begin each run with +40 max HP", cost: 2, apply: (p) => { p.permanentUpgrades.startShield = true; } },
+  { id: "crit_chance", name: "Sharpshot", desc: "+2% crit chance per upgrade", cost: 1, apply: (p) => { p.permanentUpgrades.critChance = (p.permanentUpgrades.critChance||0) + 0.02; } },
+  { id: "extra_reroll", name: "Reroll Master", desc: "+1 powerup reroll per run", cost: 2, apply: (p) => { p.permanentUpgrades.extraReroll = (p.permanentUpgrades.extraReroll||0) + 1; } },
+  { id: "damage_boost", name: "Piercing Rounds", desc: "+10% bullet damage", cost: 1, apply: (p) => { p.permanentUpgrades.damageBuff = (p.permanentUpgrades.damageBuff||0) + 0.1; } },
+  { id: "regen_passive", name: "Resilience", desc: "Regen 0.02 HP per frame in-run", cost: 2, apply: (p) => { p.permanentUpgrades.passiveRegen = (p.permanentUpgrades.passiveRegen||0) + 0.02; } },
+];
+
+// Game modes
+const GAME_MODES = [
+  { id: "survival", name: "Survival", icon: "🎯", desc: "Endless waves. Upgrades. Leaderboard.", color: "#22c55e" },
+  { id: "koth", name: "King of Hill", icon: "👑", desc: "Control center. First to 5 points.", color: "#f97316" },
+  { id: "horde", name: "Horde Mode", icon: "🧟", desc: "100 waves. Pure endurance.", color: "#ef4444" },
+  { id: "oneshot", name: "One-Shot", icon: "⚡", desc: "One hit = death. Pure skill.", color: "#facc15" },
+];
+
+// Arena events
+const ARENA_EVENTS = [
+  { id: "meteor", name: "Meteor Shower" },
+  { id: "shrink", name: "Shrinking Arena" },
+  { id: "blackout", name: "Blackout" },
+];
+
 function makeTank(x, y, hp, skin) {
   return {
     x, y, angle: 0, vx: 0, vy: 0,
@@ -302,11 +337,18 @@ function makeTank(x, y, hp, skin) {
     homingBullets: false, multiShot: false, doubleShot: false,
     cryoBullets: false, lifeSteal: false,
     hasOvercharge: false, overchargeCd: 0,
-    hasBarrier: false, barrierCd: 0,
+    hasBarrier: false, barrierCd: 0, barrierStacks: 0,
     warpBullets: false,
     regen: 0, reflectChance: 0, hasDash: false, explosiveBullets: false,
     lastDash: 0, upgrades: {},
     slowTimer: 0,
+    // ultimate abilities
+    abilities: { empCd: 0, strikeCd: 0 },
+    stunTimer: 0,
+    // game feel
+    lastHitFlash: 0, bulletTrailColor: "#fff", recoilX: 0, recoilY: 0,
+    // passives
+    passiveRegen: 0, shieldBoost: 0,
   };
 }
 
@@ -350,6 +392,7 @@ export default function TankWars() {
   const canvasRef    = useRef(null);
   const keysRef      = useRef({});
   const stateRef     = useRef(null);
+  const shakeRef     = useRef(0);
   const modeRef      = useRef("");
   const scoreRef     = useRef(0);
   const waveRef      = useRef(0);
@@ -389,6 +432,10 @@ export default function TankWars() {
   const [hoveredPu,        setHoveredPu]        = useState(null);
   const [hoveredMode,      setHoveredMode]      = useState(null);
   const [offeredPowerups,  setOfferedPowerups]  = useState([]);
+  const [comboNotify,      setComboNotify]      = useState(null);
+  const [screen2,          setScreen2]          = useState(null);
+  const [dailyChallenge,   setDailyChallenge]   = useState(null);
+  const [droneCompanion,   setDroneCompanion]   = useState(null);
   const [leaderboard,      setLeaderboard]      = useState([]);
   const [lbLoading,        setLbLoading]        = useState(false);
   const [isMobile,         setIsMobile]         = useState(false);
@@ -402,6 +449,57 @@ export default function TankWars() {
   const [onlineStatus,     setOnlineStatus]     = useState(""); // status message
   const [onlineWaiting,    setOnlineWaiting]    = useState(false);
   const [pvpMapChoice,     setPvpMapChoice]     = useState("open");
+
+  // --- progression defaults in localStorage ----
+  function loadFullProfile(name){
+    const p = loadProfileForUser(name) || {};
+    return { coins: p.coins||0, ownedSkins: p.ownedSkins||["default"], equippedSkin: p.equippedSkin||"default", level: p.level||1, xp: p.xp||0, perkPoints: p.perkPoints||0, permanentUpgrades: p.permanentUpgrades||{} };
+  }
+  function saveFullProfile(name, prof){
+    const base = loadProfileForUser(name) || {};
+    const merged = { ...base, coins: prof.coins, ownedSkins: prof.ownedSkins, equippedSkin: prof.equippedSkin, level: prof.level, xp: prof.xp, perkPoints: prof.perkPoints, permanentUpgrades: prof.permanentUpgrades };
+    saveProfileForUser(name, merged);
+  }
+
+  function grantXp(name, amount){
+    if(!name) return;
+    const prof = loadFullProfile(name);
+    prof.xp = (prof.xp||0) + amount;
+    const lvlUpXp = 100 + (prof.level-1)*50;
+    while(prof.xp >= lvlUpXp){
+      prof.xp -= lvlUpXp; prof.level = (prof.level||1) + 1; prof.perkPoints = (prof.perkPoints||0) + 1; // 1 point per level
+    }
+    saveFullProfile(name, prof);
+    setCoins(prof.coins||0); // ensure coins reflect profile
+  }
+
+  function applyPermanentUpgradesToTank(p, prof){
+    if(!prof) return;
+    const up = prof.permanentUpgrades||{};
+    if(up.reloadSpeed) p.shootCd = Math.max(40, (p.shootCd||BASE_SHOOT_CD) * (1 - up.reloadSpeed));
+    if(up.startShield) { p.hp = Math.min(p.maxHp, p.hp + 40); p.maxHp += 40; }
+    if(up.critChance) { p.critBonus = (p.critBonus||0) + up.critChance; }
+    if(up.damageBuff) p.bulletDamage = (p.bulletDamage||BASE_DAMAGE) * (1 + up.damageBuff);
+    if(up.passiveRegen) p.passiveRegen = (p.passiveRegen||0) + up.passiveRegen;
+  }
+
+  function getDailyChallenge() {
+    const seed = Math.floor(Date.now() / 86400000);
+    const challenges = [
+      { name: "Explosive Only", desc: "Only explosive rounds", modifier: (p) => { p.explosiveBullets=true; } },
+      { name: "Speed Demon", desc: "Enemies 1.5x faster", modifier: (s) => { s.enemySpeedMult=1.5; } },
+      { name: "Hardcore", desc: "One hit = death", modifier: (p) => { p.oneShot=true; } },
+      { name: "No Heal", desc: "No healing", modifier: (p) => { p.noHealing=true; } },
+    ];
+    return challenges[seed % challenges.length];
+  }
+
+  function getArenaEvent() {
+    const r = Math.random();
+    if(r<0.3) return ARENA_EVENTS[0];
+    if(r<0.6) return ARENA_EVENTS[1];
+    return ARENA_EVENTS[2];
+  }
 
   useEffect(() => {
     const mobile = isTouchDevice();
@@ -523,7 +621,7 @@ export default function TankWars() {
       while(tries<40&&Math.hypot(ex-state.p1.x,ey-state.p1.y)<160);
       const isElite=wave>3&&Math.random()<0.3;
       const isBoss=wave>5&&Math.random()<0.1&&i===0;
-      state.enemies.push({
+      const enemy = {
         x:ex,y:ey,angle:0,vx:0,vy:0,
         hp:(isBoss?200:40)+wave*(isBoss?15:6),
         maxHp:(isBoss?200:40)+wave*(isBoss?15:6),
@@ -542,7 +640,39 @@ export default function TankWars() {
         lastX:ex,lastY:ey,
         waypointX:null,waypointY:null,
         flankAngle:Math.random()*Math.PI*2,
-      });
+      };
+      if(isBoss){
+        enemy.bossType = BOSS_TYPES[Math.floor(Math.random()*BOSS_TYPES.length)];
+        enemy.maxHp = enemy.hp = Math.round(enemy.hp * (1.8 + Math.random()*1.2));
+        enemy.spd = 0.5;
+        enemy.shootDelay = Math.max(220, enemy.shootDelay*0.6);
+        enemy.bossMeta = {};
+        // type-specific tweaks
+        if(enemy.bossType === "siege"){
+          enemy.siege = true; enemy.siegeTimer = 0; enemy.color = "#d97706"; enemy.barrel = "#92400e";
+        } else if(enemy.bossType === "splitter"){
+          enemy.splitter = true; enemy.splitCount = 2; enemy.color = "#ef4444"; enemy.barrel = "#7f1d1d";
+        } else if(enemy.bossType === "stealth"){
+          enemy.stealth = true; enemy.visibleTimer = 0; enemy.color = "#94a3b8"; enemy.barrel = "#475569";
+        } else if(enemy.bossType === "railgun"){
+          enemy.railgun = true; enemy.railCharge = 0; enemy.railCooldown = 0; enemy.color = "#60a5fa";
+        } else if(enemy.bossType === "summoner"){
+          enemy.summoner = true; enemy.summonCd = 0; enemy.color = "#34d399";
+        }
+        state.lastWaveHadBoss = true;
+        // announce boss
+        if(state.bossAnnounce==null) state.bossAnnounce = { text: `BOSS: ${enemy.bossType.toUpperCase()}`, timer: 240 };
+      }
+      // assign enemy behavior types for variety
+      if(!isBoss){
+        const r=Math.random();
+        if(r<0.08) enemy.type='sniper';
+        else if(r<0.14) enemy.type='kamikaze';
+        else if(r<0.20) enemy.type='turret';
+        else if(r<0.26) enemy.type='healer';
+        else if(r<0.40) enemy.type='scout';
+      }
+      state.enemies.push(enemy);
     }
   }
 
@@ -557,7 +687,12 @@ export default function TankWars() {
     const randomMap=MAPS[Math.floor(Math.random()*MAPS.length)];
     mapRef.current=randomMap;
     const skin=getSkin(equippedSkin);
-    stateRef.current={p1:makeTank(W/2,H/2,100,skin),p2:null,enemies:[],bullets:[],particles:[],explosions:[]};
+    stateRef.current={p1:makeTank(W/2,H/2,100,skin),p2:null,enemies:[],bullets:[],particles:[],explosions:[],drones:[],arenaSize:1,slowMotion:0};
+    // apply permanent progression upgrades from profile
+    if(username){
+      const prof = loadFullProfile(username);
+      applyPermanentUpgradesToTank(stateRef.current.p1, prof);
+    }
     modeRef.current="survival";
     spawnWave(stateRef.current,1);
     setScreen("game");
@@ -714,10 +849,41 @@ export default function TankWars() {
     const pu=POWERUPS.find(p=>p.id===puId);
     const p1=stateRef.current.p1;
     pu.apply(p1);
+    // grant small XP and coins for picking
+    grantXp(username, 8 + Math.round(waveRef.current * 2));
+    setCoins(c=>c+5);
+    // detect simple synergies
+    if(p1.ghostBullets && p1.explosiveBullets){
+      p1.ghostExplodeWalls = true; setComboNotify({text:"Combo: Phasing Explosions",timer:160});
+    }
+    if(p1.cryoBullets && p1.homingBullets){ setComboNotify({text:"Combo: Cryo Homing",timer:160}); p1.homingCries=true; }
+    if(p1.multiShot && p1.pierceBullets){ setComboNotify({text:"Combo: Bullet Storm",timer:160}); }
+    if(p1.lifeSteal && p1.shootCd < BASE_SHOOT_CD - 100){ setComboNotify({text:"Combo: Vampire Barrage",timer:160}); }
+    if(p1.cryoBullets && p1.triShot){ setComboNotify({text:"Combo: Frost Spread",timer:160}); }
+    if(p1.explosiveBullets && p1.doubleShot){ setComboNotify({text:"Combo: Double Blast",timer:160}); }
     p1.upgrades[puId]=(p1.upgrades[puId]||0)+1;
+    // spawn drone if companion unlocked
+    if(droneCompanion && Math.random()<0.4){
+      const d={x:p1.x+Math.random()*40-20,y:p1.y+Math.random()*40-20,vx:0,vy:0,angle:0,type:droneCompanion};
+      stateRef.current.drones.push(d);
+    }
     pendingPuRef.current=false;
     waveRef.current++;
     spawnWave(stateRef.current,waveRef.current);
+    // trigger arena event every 3 waves
+    if(waveRef.current % 3 === 0){
+      const ev=getArenaEvent();
+      if(ev) {
+        setComboNotify({text:`Arena: ${ev.name}`,timer:180});
+        if(ev.id==='meteor'){
+          for(let i=0;i<4;i++) setTimeout(()=>spawnExplosion(BORDER+Math.random()*800, BORDER+Math.random()*560), i*400);
+        } else if(ev.id==='shrink'){
+          stateRef.current.arenaSize = Math.max(0.6, stateRef.current.arenaSize - 0.15);
+        } else if(ev.id==='blackout'){
+          stateRef.current.blackoutTimer = 180;
+        }
+      }
+    }
     setHoveredPu(null);
     setScreen("game");
   }
@@ -778,6 +944,21 @@ export default function TankWars() {
     function spawnExplosion(x,y) {
       stateRef.current.explosions.push({x,y,r:0,maxR:50,life:18,maxLife:18});
       spawnParticles(x,y,"#f97316",16);
+      // screen shake
+      shakeRef.current = Math.max(shakeRef.current, 10);
+      // slow-motion on explosion
+      if(!stateRef.current.slowMotion) stateRef.current.slowMotion = 0;
+      stateRef.current.slowMotion = Math.min(stateRef.current.slowMotion + 8, 60);
+      // damage destructible walls if present
+      const map = mapRef.current;
+      if(map && map.destructibleWalls){
+        for(const w of map.destructibleWalls){
+          const dx = x - (w.x + w.w/2), dy = y - (w.y + w.h/2);
+          const dist = Math.hypot(dx,dy);
+          if(dist < 120){ w.hp = (w.hp||20) - Math.round((120-dist)/8); }
+        }
+        map.destructibleWalls = (map.destructibleWalls||[]).filter(w=> (w.hp||0) > 0 );
+      }
     }
 
     function getMobileInput(p, ts) {
@@ -870,6 +1051,23 @@ export default function TankWars() {
         }
         p.lastShot=ts;
       }
+
+      // Ultimate abilities: EMP (Q) and Airstrike (E)
+      if(shooterId==='p1'){
+        if(keysRef.current['q'] && p.abilities.empCd<=0){
+          // EMP: stun nearby enemies
+          p.abilities.empCd = 9000; // 9s
+          const R=140;
+          stateRef.current.enemies.forEach(en=>{ if(Math.hypot(en.x-p.x,en.y-p.y)<R) en.slowTimer = Math.max(en.slowTimer||0, 120); });
+          spawnParticles(p.x,p.y,"#60a5fa",20); setComboNotify({text:"EMP Pulse",timer:120});
+        }
+        if(keysRef.current['e'] && p.abilities.strikeCd<=0){
+          // Airstrike: spawn 3 explosions in front of player
+          p.abilities.strikeCd = 12000;
+          for(let i=1;i<=3;i++){ const tx=p.x+Math.cos(p.angle)*(80+i*40)+((Math.random()-0.5)*30); const ty=p.y+Math.sin(p.angle)*(80+i*40)+((Math.random()-0.5)*30); setTimeout(()=>spawnExplosion(tx,ty), i*220); }
+          setComboNotify({text:"Airstrike Called",timer:160});
+        }
+      }
     }
 
     function updateEnemyAI(e, target, ts, walls, W, H) {
@@ -923,6 +1121,29 @@ export default function TankWars() {
         moveAngle = Math.atan2(dy, dx) + (Math.sin(ts * 0.003 + e.flankAngle) * 0.25);
       }
 
+      // type-specific overrides
+      if(e.type==='sniper'){
+        // keep distance
+        if(dist < 220) moveAngle = Math.atan2(-dy,-dx);
+        moveSpeed = e.spd * 0.6;
+        e.shootDelay = Math.max(1200, e.shootDelay*1.4);
+      } else if(e.type==='kamikaze'){
+        // charge when close
+        moveSpeed = e.spd * 1.6;
+        if(dist < 80){ e.hp = 0; spawnExplosion(e.x,e.y); }
+      } else if(e.type==='turret'){
+        // stay mostly stationary and rotate
+        moveSpeed = 0; const aimAngle = Math.atan2(dy,dx); let dA = aimAngle - e.angle; while(dA>Math.PI) dA-=2*Math.PI; while(dA<-Math.PI) dA+=2*Math.PI; e.angle += dA*0.12; e.shootDelay = Math.max(300, e.shootDelay*0.6);
+      } else if(e.type==='healer'){
+        // heal nearby allies
+        moveSpeed = e.spd * 0.9;
+        if(ts % 600 < 16){
+          stateRef.current.enemies.forEach(ee=>{ if(ee!==e && Math.hypot(ee.x-e.x,ee.y-e.y)<120) ee.hp = Math.min(ee.maxHp, ee.hp + 8); });
+        }
+      } else if(e.type==='scout'){
+        moveSpeed = e.spd * 1.6;
+      }
+
       const vx = Math.cos(moveAngle) * moveSpeed, vy = Math.sin(moveAngle) * moveSpeed;
       let newX = Math.max(BL, Math.min(BR, e.x + vx)), blockedX = false;
       for (const w of walls) { if (rectsOverlap(newX - hw, e.y - hh, TW, TH, w.x, w.y, w.w, w.h)) { newX = e.x; blockedX = true; break; } }
@@ -939,12 +1160,56 @@ export default function TankWars() {
       while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
       e.angle += angleDiff * 0.1;
 
+      // Boss-specific behaviors
+      if (e.summoner) {
+        e.summonCd = (e.summonCd || 0) - 16;
+        if (e.summonCd <= 0) {
+          e.summonCd = 1200 + Math.random() * 600;
+          // spawn a small drone
+          const droneHp = Math.max(20, Math.round(e.maxHp * 0.08));
+          const dx = (Math.random() - 0.5) * 40, dy = (Math.random() - 0.5) * 40;
+          stateRef.current.enemies.push({ x: e.x + dx, y: e.y + dy, angle: 0, vx: 0, vy: 0, hp: droneHp, maxHp: droneHp, color: "#ecfccb", barrel: "#86efac", tread: "#a3e635", lastShot: 0, spd: 1.6, shootDelay: 900, isElite: false, isBoss: false, slowTimer: 0, aiState: "approach", strafeDir: Math.random() < 0.5 ? 1 : -1, strafeTimer: 0, stuckTimer: 0, lastX: e.x, lastY: e.y, waypointX: null, waypointY: null, flankAngle: Math.random() * Math.PI * 2 });
+        }
+      }
+
+      if (e.railgun) {
+        if (!e.railCooldown) e.railCooldown = 0;
+        if (e.railCharge && e.railCharge > 0) {
+          e.railCharge += 16;
+          if (e.railCharge > 420) {
+            // fire rail shot
+            const bx = e.x + Math.cos(e.angle) * 16, by = e.y + Math.sin(e.angle) * 16;
+            shootBullet(bx, by, e.angle, "enemy", "#60a5fa", { bulletLifetime: BASE_BULLET_LIFETIME * 2, bulletSize: BASE_BULLET_SIZE * 3, bulletDamage: 40, explosive: false });
+            e.railCharge = 0; e.railCooldown = 2000;
+          }
+        } else {
+          e.railCooldown = Math.max(0, (e.railCooldown || 0) - 16);
+          if (e.railCooldown <= 0 && Math.random() < 0.008) { e.railCharge = 1; }
+        }
+      }
+
+      if (e.siege) {
+        e.siegeTimer = (e.siegeTimer || 0) - 16;
+        if (e.siegeTimer <= 0 && Math.random() < 0.06) {
+          e.siegeTimer = 800 + Math.random() * 800;
+          // fire an explosive mortar (simulated with explosive bullet)
+          const bx = e.x + Math.cos(e.angle) * 16, by = e.y + Math.sin(e.angle) * 16;
+          shootBullet(bx, by, e.angle, "enemy", "#b45309", { bulletLifetime: BASE_BULLET_LIFETIME * 1.2, bulletSize: BASE_BULLET_SIZE * 2, bulletDamage: 22, explosive: true });
+        }
+      }
+
+      if (e.stealth) {
+        e.visibleTimer = Math.max(0, (e.visibleTimer || 0) - 16);
+      }
+
       if (canSee && Math.abs(angleDiff) < 0.25 && ts - e.lastShot > e.shootDelay) {
         const bx = e.x + Math.cos(e.angle) * 16, by = e.y + Math.sin(e.angle) * 16;
         shootBullet(bx, by, e.angle, "enemy", "#f97316", { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE + (e.isElite ? 2 : 0) + (e.isBoss ? 3 : 0), bulletDamage: e.isBoss ? 14 : e.isElite ? 9 : 5 });
         if (e.isElite || e.isBoss) shootBullet(e.x + Math.cos(e.angle + 0.3) * 16, e.y + Math.sin(e.angle + 0.3) * 16, e.angle + 0.3, "enemy", e.isBoss ? "#fbbf24" : "#ff6b00", { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE, bulletDamage: e.isBoss ? 10 : 7 });
         if (e.isBoss) shootBullet(e.x + Math.cos(e.angle - 0.3) * 16, e.y + Math.sin(e.angle - 0.3) * 16, e.angle - 0.3, "enemy", "#fbbf24", { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE, bulletDamage: 10 });
         e.lastShot = ts;
+        // make stealth bosses visible briefly when they fire
+        if (e.stealth) e.visibleTimer = 180;
       } else if (!canSee && ts - e.lastShot > e.shootDelay * 2 && dist < 200) {
         shootBullet(e.x + Math.cos(e.angle) * 16, e.y + Math.sin(e.angle) * 16, e.angle, "enemy", "#f97316", { bulletLifetime: BASE_BULLET_LIFETIME, bulletSize: BASE_BULLET_SIZE, bulletDamage: e.isBoss ? 14 : e.isElite ? 9 : 5 });
         e.lastShot = ts;
@@ -1082,6 +1347,12 @@ export default function TankWars() {
     let lastHudUpdate=0;
 
     function loop(ts) {
+      // slow-motion effect: skip update frames
+      if(stateRef.current?.slowMotion && stateRef.current.slowMotion > 0){
+        stateRef.current.slowMotion -= 16;
+        if(stateRef.current.slowMotion > 0) { rafRef.current=requestAnimationFrame(loop); return; }
+      }
+
       const {W,H}=dimRef.current;
       const s=stateRef.current;
       const keys=keysRef.current;
@@ -1128,8 +1399,11 @@ export default function TankWars() {
         }
 
         if(mode==="survival"){
-          s.enemies.forEach(e=>{ updateEnemyAI(e, s.p1, ts, walls, W, H); });
+          s.enemies.forEach(e=>{ if(e.stunTimer>0) e.stunTimer = Math.max(0, e.stunTimer-16); else updateEnemyAI(e, s.p1, ts, walls, W, H); });
         }
+
+        // abilities cooldowns (global tick)
+        if(s.p1){ s.p1.abilities.empCd = Math.max(0, (s.p1.abilities.empCd||0)-16); s.p1.abilities.strikeCd = Math.max(0, (s.p1.abilities.strikeCd||0)-16); }
 
         s.bullets.forEach(b=>updateBullet(b));
 
@@ -1174,7 +1448,21 @@ export default function TankWars() {
 
         const before=s.enemies.length;
         s.enemies=s.enemies.filter(e=>{
-          if(e.hp<=0){ spawnParticles(e.x,e.y,e.isBoss?"#fbbf24":e.isElite?"#f87171":"#f97316",e.isBoss?24:e.isElite?16:10); return false; }
+          if(e.hp<=0){
+            // splitter boss spawns children
+            if(e.splitter && !(e._splitDone)){
+              e._splitDone = true;
+              const cnt = e.splitCount || 2;
+              for(let si=0;si<cnt;si++){
+                const ang = Math.random()*Math.PI*2;
+                const nx = e.x + Math.cos(ang)*18, ny = e.y + Math.sin(ang)*18;
+                const childHp = Math.max(20, Math.round(e.maxHp * 0.28));
+                s.enemies.push({ x:nx,y:ny,angle:0,vx:0,vy:0,hp:childHp,maxHp:childHp,color:'#fb7185',barrel:'#e11d48',tread:'#7f1d1d',lastShot:0,spd:1.1,shootDelay:800,isElite:false,isBoss:false,slowTimer:0,aiState:'approach',strafeDir:Math.random()<0.5?1:-1,strafeTimer:0,stuckTimer:0,lastX:nx,lastY:ny,waypointX:null,waypointY:null,flankAngle:Math.random()*Math.PI*2});
+              }
+            }
+            spawnParticles(e.x,e.y,e.isBoss?"#fbbf24":e.isElite?"#f87171":"#f97316",e.isBoss?24:e.isElite?16:10);
+            return false;
+          }
           return true;
         });
         const killed=before-s.enemies.length;
@@ -1189,7 +1477,13 @@ export default function TankWars() {
 
         if(mode==="survival"&&s.enemies.length===0&&!pendingPuRef.current){
           pendingPuRef.current=true;
-          const offers=getRandomPowerups(4);
+          let offers;
+          if(s.lastWaveHadBoss){
+            offers = [...BOSS_POWERUPS].sort(()=>Math.random()-0.5).slice(0,4);
+            s.lastWaveHadBoss = false;
+          } else {
+            offers = getRandomPowerups(4);
+          }
           const waveCoins=Math.round(30+waveRef.current*15);
           setCoins(c=>c+waveCoins);
           cancelAnimationFrame(rafRef.current);
@@ -1223,6 +1517,9 @@ export default function TankWars() {
       }
 
       // ── DRAW ──────────────────────────────────────────────────────────────
+      // apply screen shake
+      let _shaked=false;
+      if(shakeRef.current>0){ const sx=(Math.random()*2-1)*shakeRef.current, sy=(Math.random()*2-1)*shakeRef.current; ctx.save(); ctx.translate(sx,sy); shakeRef.current = Math.max(0, shakeRef.current-0.5); _shaked=true; }
       ctx.fillStyle=map.bg; ctx.fillRect(0,0,W,H);
       ctx.strokeStyle=map.grid; ctx.lineWidth=0.8;
       const gSz=Math.round(W/20);
@@ -1237,6 +1534,16 @@ export default function TankWars() {
         ctx.fillStyle="rgba(0,0,0,0.3)"; ctx.fillRect(w.x,w.y+w.h-Math.min(4,w.h),w.w,Math.min(4,w.h));
         ctx.strokeStyle="rgba(255,255,255,0.05)"; ctx.lineWidth=1;
         ctx.beginPath(); roundRect(ctx,w.x,w.y,w.w,w.h,4); ctx.stroke();
+      });
+      // destructible walls
+      const dws = map.destructibleWalls || [];
+      dws.forEach(w=>{
+        ctx.fillStyle = "#6b7280";
+        ctx.beginPath(); roundRect(ctx,w.x,w.y,w.w,w.h,4); ctx.fill();
+        ctx.fillStyle = "rgba(255,255,255,0.06)"; ctx.fillRect(w.x,w.y,w.w,Math.min(6,w.h));
+        // HP bar
+        const hpPct = Math.max(0, (w.hp||20)/20);
+        ctx.fillStyle = "#ef4444"; ctx.fillRect(w.x, w.y - 8, w.w * hpPct, 4);
       });
 
       s.explosions.forEach(ex=>{
@@ -1256,8 +1563,30 @@ export default function TankWars() {
 
       const showLabels=is2PLike;
       if(s.p1.hp>0) drawTank(s.p1,showLabels?"P1":null);
+      // draw hit flash overlay
+      if(s.p1.lastHitFlash>0){
+        ctx.globalAlpha = Math.max(0, s.p1.lastHitFlash/15) * 0.4;
+        ctx.fillStyle = "#ff6b6b";
+        ctx.beginPath(); ctx.arc(s.p1.x,s.p1.y,TW/2+5,0,Math.PI*2); ctx.fill();
+        ctx.globalAlpha = 1;
+        s.p1.lastHitFlash -= 16;
+      }
       if(s.p2&&s.p2.hp>0) drawTank(s.p2,showLabels?"P2":null);
+      if(s.p2 && s.p2.lastHitFlash>0){
+        ctx.globalAlpha = Math.max(0, s.p2.lastHitFlash/15) * 0.4;
+        ctx.fillStyle = "#ff6b6b";
+        ctx.beginPath(); ctx.arc(s.p2.x,s.p2.y,TW/2+5,0,Math.PI*2); ctx.fill();
+        ctx.globalAlpha = 1;
+        s.p2.lastHitFlash -= 16;
+      }
       s.enemies.forEach(e=>{
+        // railgun warning line
+        if(e.railgun && e.railCharge && e.railCharge>0){
+          const progress = Math.min(1, e.railCharge / 420);
+          ctx.save(); ctx.globalAlpha = 0.25 + 0.65 * progress; ctx.strokeStyle = `rgba(255,80,80,${0.9*progress})`; ctx.lineWidth = 2 + 6*progress;
+          ctx.beginPath(); ctx.moveTo(e.x, e.y); ctx.lineTo(s.p1.x, s.p1.y); ctx.stroke(); ctx.restore();
+        }
+
         if(e.isBoss){
           ctx.save(); ctx.translate(e.x,e.y);
           ctx.beginPath(); ctx.arc(0,0,32,0,Math.PI*2); ctx.strokeStyle="rgba(251,191,36,0.5)"; ctx.lineWidth=3; ctx.stroke();
@@ -1268,7 +1597,27 @@ export default function TankWars() {
           ctx.beginPath(); ctx.arc(0,0,28,0,Math.PI*2); ctx.strokeStyle="rgba(251,191,36,0.35)"; ctx.lineWidth=2; ctx.stroke();
           ctx.restore();
         }
+
+        // stealth bosses are invisible unless visibleTimer > 0
+        if(e.stealth && (!e.visibleTimer || e.visibleTimer<=0)){
+          // draw a faint shimmer occasionally (subtle indicator)
+          if(Math.random()<0.004){ ctx.globalAlpha=0.06; ctx.fillStyle=e.color; ctx.beginPath(); ctx.arc(e.x,e.y,10,0,Math.PI*2); ctx.fill(); ctx.globalAlpha=1; }
+          return;
+        }
+
         drawTank(e,null);
+      });
+
+      // draw drones
+      const drones = s.drones || [];
+      drones.forEach(d=>{
+        ctx.save(); ctx.translate(d.x,d.y);
+        const t = DRONE_TYPES[d.type];
+        ctx.fillStyle = "#34d399";
+        ctx.beginPath(); ctx.arc(0,0,6,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle = "#10b981";
+        ctx.beginPath(); ctx.arc(0,0,3,0,Math.PI*2); ctx.fill();
+        ctx.restore();
       });
 
       s.bullets.forEach(b=>{
@@ -1287,6 +1636,14 @@ export default function TankWars() {
         ctx.fillStyle="rgba(0,0,0,0.5)"; ctx.fillRect(W/2-80,8,160,22);
         ctx.fillStyle="#facc15"; ctx.font=`bold ${Math.round(W/65)}px 'Courier New'`; ctx.textAlign="center";
         ctx.fillText(`◆ Wave ${waveRef.current} — ${map.name} ◆`,W/2,23); ctx.textAlign="left";
+      }
+      // combo / synergy notifications
+      if(comboNotify && comboNotify.timer>0){
+        comboNotify.timer -= 16;
+        ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(12,8,260,28);
+        ctx.fillStyle = "#c7f9d3"; ctx.font = "bold 13px 'Courier New'"; ctx.textAlign = "left";
+        ctx.fillText(comboNotify.text, 20, 28);
+        if(comboNotify.timer<=0) setComboNotify(null);
       }
       if(is2PLike){
         ctx.fillStyle="rgba(0,0,0,0.6)"; ctx.fillRect(W/2-110,8,220,24);
@@ -1315,6 +1672,16 @@ export default function TankWars() {
         });
       }
 
+      // boss announcement overlay
+      if(s.bossAnnounce){
+        s.bossAnnounce.timer -= 16;
+        ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(W/2-220,H/2-40,440,80);
+        ctx.fillStyle = "#facc15"; ctx.font = "bold 20px 'Courier New'"; ctx.textAlign = "center";
+        ctx.fillText(s.bossAnnounce.text, W/2, H/2+6);
+        if(s.bossAnnounce.timer<=0) s.bossAnnounce = null;
+      }
+
+      if(_shaked) ctx.restore();
       rafRef.current=requestAnimationFrame(loop);
     }
 
@@ -1624,6 +1991,30 @@ export default function TankWars() {
               </div>
             </div>
           </div>
+
+          {/* Progression & Challenges */}
+          <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:isMobile?10:14,marginBottom:isMobile?16:24,width:"100%"}}>
+            {/* Skill Tree */}
+            <div onClick={()=>setScreen2("skillTree")} onMouseEnter={()=>!isMobile&&setHoveredMode("skills")} onMouseLeave={()=>!isMobile&&setHoveredMode(null)}
+              style={{padding:isMobile?"16px 10px":"22px 18px",background:hoveredMode==="skills"?"rgba(34,197,94,0.06)":"rgba(255,255,255,0.02)",border:`1.5px solid ${hoveredMode==="skills"?"#22c55e":"#0f172a"}`,borderRadius:16,cursor:"pointer",transition:"all 0.2s ease",transform:hoveredMode==="skills"?"translateY(-6px)":"none",display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?8:10,WebkitTapHighlightColor:"transparent"}}>
+              <div style={{fontSize:isMobile?24:28}}>🎖️</div>
+              <div style={{textAlign:"center"}}>
+                <div style={{fontSize:isMobile?14:16,fontWeight:900,letterSpacing:"0.1em",color:hoveredMode==="skills"?"#22c55e":"#e2e8f0"}}>UPGRADES</div>
+                {!isMobile&&<div style={{fontSize:10,color:"#475569",marginTop:2}}>SKILL TREE</div>}
+              </div>
+            </div>
+
+            {/* Daily Challenge */}
+            <div onClick={()=>{setDailyChallenge(getDailyChallenge());setScreen2("dailyChallenge");}} onMouseEnter={()=>!isMobile&&setHoveredMode("daily")} onMouseLeave={()=>!isMobile&&setHoveredMode(null)}
+              style={{padding:isMobile?"16px 10px":"22px 18px",background:hoveredMode==="daily"?"rgba(250,204,21,0.06)":"rgba(255,255,255,0.02)",border:`1.5px solid ${hoveredMode==="daily"?"#facc15":"#0f172a"}`,borderRadius:16,cursor:"pointer",transition:"all 0.2s ease",transform:hoveredMode==="daily"?"translateY(-6px)":"none",display:"flex",flexDirection:"column",alignItems:"center",gap:isMobile?8:10,WebkitTapHighlightColor:"transparent"}}>
+              <div style={{fontSize:isMobile?24:28}}>⭐</div>
+              <div style={{textAlign:"center"}}>
+                <div style={{fontSize:isMobile?14:16,fontWeight:900,letterSpacing:"0.1em",color:hoveredMode==="daily"?"#facc15":"#e2e8f0"}}>CHALLENGE</div>
+                {!isMobile&&<div style={{fontSize:10,color:"#475569",marginTop:2}}>DAILY QUEST</div>}
+              </div>
+            </div>
+          </div>
+
 
           <div style={{display:"flex",gap:isMobile?10:20,borderTop:"1px solid #0a0a1a",paddingTop:10,paddingBottom:isMobile?12:0,fontSize:isMobile?10:11,color:"#334155",flexWrap:"wrap",justifyContent:"center"}}>
             <span>Skin: <span style={{color:SKINS.find(s=>s.id===equippedSkin)?.body}}>{SKINS.find(s=>s.id===equippedSkin)?.name}</span></span>
@@ -1964,6 +2355,51 @@ export default function TankWars() {
           </div>
         </div>
       )}
-    </div>
-  );
-}
+
+      {/* ── SKILL TREE ─────────────────────────────────────────────────────── */}
+      {screen2=="="="skillTree"&&(
+        <div className="fade-in" style={{display:"flex",flexDirection:"column",alignItems:"center",gap:24,padding:"0 16px",textAlign:"center",overflowY:"auto",maxHeight:"100vh"}}>
+          <div>
+            <h2 style={{fontSize:isMobile?24:34,fontWeight:900,color:"#22c55e",letterSpacing:"0.1em",margin:"0 0 8px"}}>SKILL TREE</h2>
+            {username&&<p style={{color:"#94a3b8",fontSize:11,margin:0}}>Level {username ? (loadFullProfile(username)?.level||1) : 1} • {username ? (loadFullProfile(username)?.perkPoints||0) : 0} Points Available</p>}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:16,width:"100%",maxWidth:600}}>
+            {PERKS.map(perk=>(
+              <button key={perk.id} onClick={()=>{
+                if(!username) return;
+                const prof = loadFullProfile(username);
+                if((prof.perkPoints||0) >= perk.cost){
+                  prof.perkPoints = (prof.perkPoints||0) - perk.cost;
+                  perk.apply(prof);
+                  saveFullProfile(username, prof);
+                  setComboNotify({text:`Unlocked: ${perk.name}`,timer:200});
+                }
+              }} style={{padding:"16px",background:"rgba(34,197,94,0.08)",border:"1.5px solid #22c55e",borderRadius:16,cursor:"pointer",color:"#e2e8f0",textAlign:"left",transition:"all 0.2s"}} onMouseEnter={e=>{e.currentTarget.style.background="rgba(34,197,94,0.15)";}} onMouseLeave={e=>{e.currentTarget.style.background="rgba(34,197,94,0.08)";}}>\n                <div style={{fontSize:14,fontWeight:800,color:"#22c55e",marginBottom:4}}>{perk.name}</div>
+                <div style={{fontSize:11,color:"#94a3b8",marginBottom:6}}>{perk.desc}</div>
+                <div style={{fontSize:10,color:"#64748b"}}>Cost: {perk.cost} Point{perk.cost>1?"s":""}</div>
+              </button>
+            ))}
+          </div>
+          <button onClick={()=>setScreen2(null)} style={{...styles.btn,background:"rgba(255,255,255,0.08)",borderColor:"#0f172a",color:"#94a3b8"}}>← Back</button>
+        </div>
+      )}
+
+      {/* ── DAILY CHALLENGE ─────────────────────────────────────────────────── */}
+      {screen2=="="="dailyChallenge"&&(
+        <div className="fade-in" style={{display:"flex",flexDirection:"column",alignItems:"center",gap:28,padding:"0 16px",textAlign:"center",maxWidth:600}}>
+          <div>
+            <h2 style={{fontSize:isMobile?28:36,fontWeight:900,color:"#facc15",letterSpacing:"0.1em",margin:"0 0 12px"}}>DAILY CHALLENGE</h2>
+            <div style={{fontSize:11,color:"#94a3b8"}}>Resets at midnight UTC</div>
+          </div>
+          {dailyChallenge && (
+            <div style={{background:"rgba(250,204,21,0.1)",border:"2px solid #facc15",borderRadius:16,padding:"24px",width:"100%"}}>
+              <div style={{fontSize:28,marginBottom:12}}>⭐</div>
+              <h3 style={{fontSize:20,fontWeight:900,color:"#facc15",margin:"0 0 8px"}}>{dailyChallenge.name}</h3>
+              <p style={{color:"#94a3b8",margin:0,fontSize:12}}>{dailyChallenge.desc}</p>
+            </div>
+          )}
+          <button onClick={()=>{setScreen2(null);startSurvival();}} style={{padding:"14px 32px",background:"rgba(250,204,21,0.15)",border:"1.5px solid #facc15",borderRadius:10,color:"#facc15",cursor:"pointer",fontSize:13,fontFamily:"'Courier New'",letterSpacing:"0.1em",fontWeight:700}}>▶ START CHALLENGE</button>
+          <button onClick={()=>setScreen2(null)} style={{...styles.btn,background:"rgba(255,255,255,0.08)",borderColor:"#0f172a",color:"#94a3b8"}}>← Back</button>
+        </div>
+      )}
+      
